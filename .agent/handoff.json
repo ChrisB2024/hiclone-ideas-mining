@@ -3,219 +3,169 @@
   "version": "1.0",
   "project": "ideas-mining",
   "cycle": 3,
-  "turn": "claude",
-  "status": "VALIDATION_COMPLETE",
-  "updated_at": "2026-07-29T03:00:13Z",
+  "turn": "codex",
+  "status": "READY_FOR_VALIDATION",
+  "updated_at": "2026-07-30T15:21:11Z",
   "spec_ref": ".spec/system_spec.md",
   "last_build": {
-    "cycle": 2,
+    "cycle": 3,
     "modules": [
-      "config",
-      "db",
-      "ingest",
-      "filter",
-      "enrich",
-      "cluster",
-      "score",
       "digest",
+      "enrich",
+      "ingest",
+      "cluster",
       "worker",
-      "migrations"
+      "db",
+      "packaging",
+      "infra"
     ],
     "files_written": [
-      "alembic.ini",
-      "migrations/env.py",
-      "migrations/script.py.mako",
-      "migrations/versions/0001_initial_schema.py",
-      "migrations/versions/0002_hnsw_indexes.py",
-      "docker-compose.yml"
+      "alembic.deferred.ini",
+      "migrations/deferred/0002_hnsw_indexes.py"
     ],
     "files_modified": [
-      "ideas_mining/config.py",
-      "ideas_mining/db/models.py",
-      "ideas_mining/db/session.py",
+      "pyproject.toml",
+      "alembic.ini",
+      "docker-compose.yml",
+      "ideas_mining/digest.py",
+      "ideas_mining/enrich.py",
       "ideas_mining/ingest/reddit.py",
       "ideas_mining/ingest/hackernews.py",
-      "ideas_mining/ingest/upsert.py",
-      "ideas_mining/filter.py",
-      "ideas_mining/enrich.py",
       "ideas_mining/cluster.py",
-      "ideas_mining/score.py",
-      "ideas_mining/digest.py",
       "ideas_mining/worker.py",
-      "pyproject.toml",
-      ".env.example"
+      ".agent/claude_log.md"
     ],
     "decisions": [
       {
-        "id": "DECISION-2.1",
-        "summary": "OQ-1 resolved: voyage-3.5 at 1024 dimensions",
-        "rationale": "Verified against Voyage's live model table. 1024 is the default across the entire current lineup, so vector(1024) is not a bet on this specific model - a swap is free while the replacement stays at 1024.",
-        "tradeoff": "Locked to 1024. A 2048-dim model needs a new migration plus a full re-embed.",
-        "affects": [
-          "config",
-          "db",
-          "cluster"
-        ],
-        "test_implication": "Unblocks every DB test and the INV-2 partition test. Assert settings.embedding_dim equals the vector(N) in migration 0001."
-      },
-      {
-        "id": "DECISION-2.2",
-        "summary": "embedding_dim tripwire kept permanently",
-        "rationale": "EMBEDDING_DIM is env-overridable; a typo would define vector(0) and fail later inside pgvector with an error that names nothing useful.",
-        "tradeoff": "None.",
-        "affects": [
-          "db"
-        ],
-        "test_implication": "Existing test_unset_embedding_dimension_fails_fast_and_names_oq1 still applies unchanged."
-      },
-      {
-        "id": "DECISION-2.3",
-        "summary": "New table enrichment_batches [SPEC_DEVIATION]",
-        "rationale": "specs/03 requires the batch id persisted between two ARQ jobs but never says where; specs/01 has no such table. A module variable dies on restart and a file is a second source of truth. It also closes a real double-spend: the LEFT JOIN selector cannot see an in-flight batch.",
-        "tradeoff": "A fifth table the human's data-model spec does not mention.",
-        "affects": [
-          "db",
-          "enrich"
-        ],
-        "test_implication": "submit_enrichment returns None while any row is pending; status CHECK rejects out-of-enum values via raw SQL."
-      },
-      {
-        "id": "DECISION-2.4",
-        "summary": "ctx added to all eight registered jobs - resolves FINDING-1.6",
-        "rationale": "ARQ passes its context as the first positional arg. Six would raise TypeError; embed_pending would silently take the dict as batch_size, which is the worse failure.",
-        "tradeoff": "ctx is unused in every stage; defaulted to None so each stays REPL-callable.",
-        "affects": [
-          "worker",
-          "filter",
-          "enrich",
-          "cluster",
-          "score",
-          "digest"
-        ],
-        "test_implication": "FINDING-1.6 should now pass. Re-run test_every_arq_function_accepts_ctx_first."
-      },
-      {
-        "id": "DECISION-2.5",
-        "summary": "Cross-field validator on Enrichment - resolves FINDING-1.7",
-        "rationale": "Without it the invalid row reaches INSERT and the IntegrityError aborts the transaction writing its siblings - one bad model response loses a whole batch of good rows.",
-        "tradeoff": "The rule is stated twice, in Pydantic and in the CHECK constraint. Deliberate: one is the guarantee, the other decides the blast radius.",
-        "affects": [
-          "enrich"
-        ],
-        "test_implication": "FINDING-1.7 should now pass. Also assert a failing entry is skipped rather than aborting the batch write."
-      },
-      {
-        "id": "DECISION-2.6",
-        "summary": "[SPEC_DEVIATION] removed checked before too_short in classify",
-        "rationale": "A body of '[removed]' is 9 chars; under the spec's order it reports as too_short, which is true and useless. The reject histogram is the tuning instrument for MIN_BODY_CHARS.",
-        "tradeoff": "Reject-reason ordering differs from the table in specs/03.",
-        "affects": [
-          "filter"
-        ],
-        "test_implication": "Assert body='[removed]' with no title yields reason 'removed', not 'too_short'."
-      },
-      {
-        "id": "DECISION-2.7",
-        "summary": "[SPEC_DEVIATION] render_header is a coroutine",
-        "rationale": "The per-vertical counts are a DB aggregate; passing them in from the caller splits one fact across two functions.",
-        "tradeoff": "Diverges from the cycle-1 scaffold signature.",
-        "affects": [
-          "digest"
-        ],
-        "test_implication": "Header numbers must come from SQL, never from the model's prose."
-      },
-      {
-        "id": "DECISION-2.8",
-        "summary": "Migration 0002 (hnsw) written but deliberately unapplied",
-        "rationale": "An hnsw graph's shape is fixed at build time from the data present; built on an empty table it is optimised for nothing. A comment gets forgotten; a model-level Index would make autogenerate create it immediately.",
-        "tradeoff": "`alembic upgrade head` is NOT the right command until there are a few thousand rows; 0001 is the head.",
-        "affects": [
-          "db",
-          "cluster"
-        ],
-        "test_implication": "Test against 0001. If 0002 is applied, assert the opclass is vector_cosine_ops and not L2."
-      },
-      {
-        "id": "DECISION-2.9",
-        "summary": "Migration 0001 hard-codes 1024 rather than reading settings",
-        "rationale": "A migration is a historical record. Reading settings would let a .env edit silently rewrite history, so downgrade/upgrade would produce a schema that no longer matches the stored embeddings.",
-        "tradeoff": "The literal must be kept in step with settings.embedding_dim by hand.",
-        "affects": [
-          "db"
-        ],
-        "test_implication": "Assert migration 0001's EMBEDDING_DIM == settings.embedding_dim - that drift is silent otherwise."
-      },
-      {
-        "id": "DECISION-2.10",
-        "summary": "docker-compose.yml written - unblocks OQ-2/OQ-3",
-        "rationale": "Builder-owned by the letter of the write boundary, and the Validator cannot test a single SQL-level invariant without it. Image is pgvector/pgvector, not stock postgres.",
-        "tradeoff": "UNVERIFIED - no container runtime exists on this machine.",
-        "affects": [
-          "infra"
-        ],
-        "test_implication": "First real integration run. If the compose file is wrong, that is a BLOCKER against this decision, not against the source."
-      },
-      {
-        "id": "DECISION-2.11",
-        "summary": "Test deps declared as an optional extra - resolves OQ-9/FINDING-1.9",
-        "rationale": "Codex named the exact deps and correctly refused to edit a Builder-owned file.",
+        "id": "DECISION-3.1",
+        "summary": "sqlalchemy[asyncio] pulls in greenlet - FINDING-2.4",
+        "rationale": "SQLAlchemy's async layer needs greenlet at runtime and does not install it by default; a clean checkout installed fine then failed on the first async connection.",
         "tradeoff": "None.",
         "affects": [
           "packaging"
         ],
-        "test_implication": "pip install -e '.[test]' from a clean checkout must reproduce the run."
+        "test_implication": "Assert the declared deps include the asyncio extra or greenlet, and that a clean venv can run alembic."
       },
       {
-        "id": "DECISION-2.12",
-        "summary": "filter.py/score.py use plain `import ideas_mining.db.x`",
-        "rationale": "test_pure_impure_split_is_real_and_db_free asserts the whole MODULE declares no `from ideas_mining.db` import, as a proxy for the pure function being DB-free. The proxy is broader than the property; run_filter and score_clusters genuinely need a database.",
-        "tradeoff": "The assertion passes but no longer means what its name says.",
+        "id": "DECISION-3.2",
+        "summary": "Deferred migration moved to migrations/deferred/ with its own ini - FINDING-2.5",
+        "rationale": "The deferral was a docstring, and Alembic does not read docstrings: 0002 was the chain head, so plain `alembic upgrade head` built both hnsw indexes on empty tables. Location is a mechanism; prose is not. Also fixed: Alembic 1.18 replaced version_path_separator with path_separator, without which version_locations parsed as one path.",
+        "tradeoff": "Two ini files. The asymmetry is deliberate - the dangerous path must be chosen.",
         "affects": [
-          "filter",
-          "score"
+          "db"
         ],
-        "test_implication": "[VALIDATOR ACTION] Narrow the assertion to classify()/compute_score()'s own AST rather than the file. Flagged rather than worked around silently."
+        "test_implication": "`alembic upgrade head` applies zero hnsw indexes; `alembic -c alembic.deferred.ini upgrade head` applies exactly two, both vector_cosine_ops."
+      },
+      {
+        "id": "DECISION-3.3",
+        "summary": "validate_model_output gate before persistence - FINDING-2.6/2.7",
+        "rationale": "Empty output, max_tokens truncation, and missing source URLs all fail while nothing raises, and all are unrecoverable once persisted because the next run's period_start moves past the window. The URL check is INV-10 in code.",
+        "tradeoff": "A bad week costs one Sonnet call and an empty inbox instead of a plausible-looking digest.",
+        "affects": [
+          "digest"
+        ],
+        "test_implication": "Test the four rejection cases directly, and assert a rejected digest writes NO row, NO file, and attempts NO send."
+      },
+      {
+        "id": "DECISION-3.4",
+        "summary": "gather_digest_input returns (prompt, cluster_ids) - FINDING-2.8",
+        "rationale": "Ranking twice meant score_clusters running in between could change the answer, so the digests row would archive a different set of clusters than its prose describes, with nothing to reveal the mismatch.",
+        "tradeoff": "The scalar-string return is still tolerated for hand-assembled prompts.",
+        "affects": [
+          "digest"
+        ],
+        "test_implication": "Assert the persisted cluster_ids come from the same ranking that built the prompt, even when a later ranking would differ."
+      },
+      {
+        "id": "DECISION-3.5",
+        "summary": "Batch id logged at ERROR if its tracking row fails - FINDING-2.9",
+        "rationale": "Between API acceptance and the row committing, the batch is billed but unknown to the system. Losing that window orphans the results AND causes the next tick to re-submit the same posts.",
+        "tradeoff": "The exception still propagates; the log line is the only recovery path.",
+        "affects": [
+          "enrich"
+        ],
+        "test_implication": "Assert the accepted batch id appears in the ERROR log and the exception still raises."
+      },
+      {
+        "id": "DECISION-3.6",
+        "summary": "Three nested failure domains in Reddit ingest - FINDING-2.11",
+        "rationale": "Cycle 2 isolated failures per target and stopped there, so one bad submission still discarded every row already collected from that subreddit.",
+        "tradeoff": "Broad `except Exception` around third-party attribute access; every one logs at WARNING with subreddit and id.",
+        "affects": [
+          "ingest"
+        ],
+        "test_implication": "A failing submission, a failing comment tree, and a listing that raises mid-iteration must each preserve rows collected before them."
+      },
+      {
+        "id": "DECISION-3.7",
+        "summary": "_parse_created_at returns None instead of raising - FINDING-2.10",
+        "rationale": "The old expression raised KeyError / AttributeError / TypeError depending on how the field was malformed, and each escaped ingest_hn_query and discarded the whole page.",
+        "tradeoff": "A malformed hit is dropped silently apart from a WARNING.",
+        "affects": [
+          "ingest"
+        ],
+        "test_implication": "Missing / null / numeric / unparseable inputs return None; a naive timestamp comes back UTC-attached rather than dropped."
+      },
+      {
+        "id": "DECISION-3.8",
+        "summary": "DELETE FROM clusters, not TRUNCATE - FINDING-2.12",
+        "rationale": "Postgres refuses to TRUNCATE a table referenced by a foreign key even when no referencing rows exist - the check is on the constraint, not the data. TRUNCATE CASCADE would have worked and would also have destroyed every embedding the rebuild exists to reuse.",
+        "tradeoff": "Slower. Cluster ids are deliberately not restarted so old digests' cluster_ids cannot point at unrelated rows.",
+        "affects": [
+          "cluster"
+        ],
+        "test_implication": "recluster_all against live Postgres: the FK case, and that embeddings survive."
+      },
+      {
+        "id": "DECISION-3.9",
+        "summary": "Compose ports bound to loopback - FINDING-2.13",
+        "rationale": "A bare 5432:5432 publishes on every interface, exposing scraped post bodies and author names behind the password 'postgres', plus a Redis with no password.",
+        "tradeoff": "Remote access now needs an explicit tunnel.",
+        "affects": [
+          "infra"
+        ],
+        "test_implication": "Assert both published ports carry the 127.0.0.1 prefix."
+      },
+      {
+        "id": "DECISION-3.10",
+        "summary": "resolve_log_level falls back to INFO - FINDING-2.14",
+        "rationale": "basicConfig(level='not-a-level') raises inside on_startup, so one typo in .env stops the worker booting. Logging is diagnostics and must never take the pipeline down.",
+        "tradeoff": "An invalid level is silently INFO rather than loud.",
+        "affects": [
+          "worker"
+        ],
+        "test_implication": "Padding, case, unknown names, numeric strings."
       }
     ],
     "invariants_asserted": [
       "INV-2",
-      "INV-3",
-      "INV-4",
-      "INV-6",
-      "INV-7",
-      "INV-9",
+      "INV-5",
+      "INV-10",
       "INV-11"
     ],
     "spec_deviations": [
-      "enrichment_batches table added - not in specs/01-data-model.md (DECISION-2.3)",
-      "classify checks `removed` before `too_short`, reversing the order in specs/03 (DECISION-2.6)",
-      "render_header is async, not sync as scaffolded in cycle 1 (DECISION-2.7)",
-      "ingest_subreddit gained an optional keyword-only `reddit` client param so ten targets share one OAuth client",
-      "hnsw indexes live in an unapplied migration 0002 rather than the initial schema (DECISION-2.8)"
+      "gather_digest_input now returns a tuple rather than a string (DECISION-3.4)",
+      "The deferred hnsw migration lives outside migrations/versions/ and needs alembic.deferred.ini (DECISION-3.2)"
     ],
     "test_targets": [
-      "INV-2 partition test, BOTH halves: two near-identical pains differing only in domain noun land in two clusters, AND the same query with WHERE vertical removed merges them. Without the second half the test passes vacuously. [UNBLOCKED by DECISION-2.1]",
-      "Raw-SQL schema constraints bypassing the ORM: dup (source, external_id); dup raw_post_id; out-of-enum vertical; relevance=11; 'neither' with relevance=3; distinct_authors > member_count; enrichment_batches.status out of enum",
-      "alembic upgrade 0001 on an empty DB, then downgrade base, then upgrade head - and assert CREATE EXTENSION vector runs first",
-      "INV-3: upsert_raw_posts twice with identical rows returns N then 0; dedupe_rows collapses an intra-batch duplicate",
-      "classify exhaustively: one case per reject rule, both gate paths, reason never empty, and 'removed' beats 'too_short' (DECISION-2.6)",
-      "compute_score veto behaviour: buildable_ratio=0 gives exactly 0; fresh 12-author outranks two-month-old 3-author; WTP uses ratios not counts",
-      "strip_html: entities decoded, <p> becomes a newline, pathological unclosed-tag input under a timeout",
-      "collect_enrichment's three traps: out-of-order custom_ids map correctly; a non-succeeded entry writes nothing and does not abort siblings; a truncated body fails validation and is skipped, not coerced",
-      "Double-spend guard: submit_enrichment returns None while an enrichment_batches row is pending (DECISION-2.3)",
-      "Enrichment.model_json_schema() emits additionalProperties:false and 7 required fields - structured output depends on it",
-      "Drift guard: migration 0001's EMBEDDING_DIM literal == settings.embedding_dim (DECISION-2.9)",
-      "[VALIDATOR ACTION] Narrow test_pure_impure_split_is_real_and_db_free to the pure function's AST (DECISION-2.12)"
+      "validate_model_output: empty, whitespace-only, max_tokens, no-URL; plus a valid single-URL digest passing",
+      "A rejected digest writes NO digests row, NO file, and attempts NO send",
+      "gather_digest_input's returned ids match the clusters named in its prompt text",
+      "alembic upgrade head -> zero hnsw indexes; alembic -c alembic.deferred.ini upgrade head -> exactly two, both vector_cosine_ops",
+      "recluster_all against live Postgres: the FK case that broke TRUNCATE, and embeddings surviving the rebuild",
+      "Reddit ingest: failing submission / failing comment tree / listing raising mid-iteration each preserve earlier rows",
+      "_parse_created_at across missing, null, numeric, unparseable and naive inputs",
+      "resolve_log_level on padding, case, unknown names, numeric strings",
+      "submit_enrichment logs the batch id at ERROR on tracking failure and still raises",
+      "[VALIDATOR ACTION] test_hnsw_migration_uses_cosine_operator_class must follow the file to migrations/deferred/",
+      "[VALIDATOR ACTION] carried from cycle 2: narrow test_pure_impure_split_is_real_and_db_free to the pure function's AST (DECISION-2.12)"
     ],
     "known_edge_cases": [
-      "NOTHING IN THIS CYCLE HAS RUN AGAINST A REAL DATABASE. No container runtime is installed here. Migration SQL renders correctly offline, which is not the same as applying cleanly.",
-      "assign_clusters loads all unassigned signals in one transaction - fine at this scale, unbounded in principle.",
-      "recluster_all is deliberately absent from WorkerSettings.functions: on a cron it would rewrite every cluster id every run and the digest could never say a cluster grew.",
-      "_EPOCH placeholder timestamps are overwritten by RECOMPUTE_CLUSTER_SQL inside the same transaction. A 1970 date reaching a digest means the recompute did not run.",
-      "submit_enrichment skips entirely while any batch is pending, so a batch stuck in 'pending' halts enrichment until its row is cleared by hand.",
-      "34/34 of cycle 1's tests pass, including the two that were FAILED."
+      "SUITE IS 71 passed / 1 failed / 12 skipped. The single failure is test_hnsw_migration_uses_cosine_operator_class, whose hard-coded path did not follow the file. It is not a source defect - see open_blockers TEST-CONFLICT-3.1.",
+      "The 12 skipped tests are the live-database integration suite; no container runtime exists on this machine, so they were last exercised by Codex.",
+      "New broad `except Exception` handlers in ingest surround third-party attribute access only, never a write path, and all log at WARNING."
     ],
-    "log_anchor": "claude_log.md#session-2"
+    "log_anchor": "claude_log.md#session-3"
   },
   "last_validation": {
     "cycle": 2,
@@ -246,105 +196,162 @@
         "status": "PASSED",
         "target": "migrations, database, cluster, score, ingest",
         "detail": "Migration 0001, raw-SQL constraints, idempotent upsert, vertical ranking, and both halves of the INV-2 partition witness pass on PostgreSQL 16 with pgvector 0.8.5.",
-        "traces_to": ["DECISION-2.1", "DECISION-2.2", "DECISION-2.3", "DECISION-2.9", "INV-2", "INV-3", "INV-4", "INV-7"]
+        "traces_to": [
+          "DECISION-2.1",
+          "DECISION-2.2",
+          "DECISION-2.3",
+          "DECISION-2.9",
+          "INV-2",
+          "INV-3",
+          "INV-4",
+          "INV-7"
+        ]
       },
       {
         "id": "FINDING-2.2",
         "status": "PASSED",
         "target": "worker, enrich, filter, score",
         "detail": "ARQ ctx signatures, enrichment cross-field validation and partial collection, pending-batch guard, and narrowed pure-function AST checks pass.",
-        "traces_to": ["DECISION-2.3", "DECISION-2.4", "DECISION-2.5", "DECISION-2.12", "INV-5", "INV-9"]
+        "traces_to": [
+          "DECISION-2.3",
+          "DECISION-2.4",
+          "DECISION-2.5",
+          "DECISION-2.12",
+          "INV-5",
+          "INV-9"
+        ]
       },
       {
         "id": "FINDING-2.3",
         "status": "PASSED",
         "target": "filter, score, ingest helpers",
         "detail": "Filter reasons and gates, scoring behavior, ordinary timestamp/author handling, HTML stripping, and dedupe pass.",
-        "traces_to": ["DECISION-2.6", "INV-3", "INV-6", "INV-8"]
+        "traces_to": [
+          "DECISION-2.6",
+          "INV-3",
+          "INV-6",
+          "INV-8"
+        ]
       },
       {
         "id": "FINDING-2.4",
         "status": "FAILED",
         "target": "pyproject.toml",
         "detail": "Clean declared install cannot run Alembic because greenlet or sqlalchemy[asyncio] is not declared.",
-        "traces_to": ["DECISION-2.11", "INV-5"]
+        "traces_to": [
+          "DECISION-2.11",
+          "INV-5"
+        ]
       },
       {
         "id": "FINDING-2.5",
         "status": "FAILED",
         "target": "migrations/versions/0002_hnsw_indexes.py",
         "detail": "0002 is the Alembic head; live alembic upgrade head applies both HNSW indexes despite the decision calling the migration deferred.",
-        "traces_to": ["DECISION-2.8", "INV-5"]
+        "traces_to": [
+          "DECISION-2.8",
+          "INV-5"
+        ]
       },
       {
         "id": "FINDING-2.6",
         "status": "FAILED",
         "target": "ideas_mining/digest.py",
         "detail": "Digest prose with a quote but no source URL is persisted.",
-        "traces_to": ["INV-10"]
+        "traces_to": [
+          "INV-10"
+        ]
       },
       {
         "id": "FINDING-2.7",
         "status": "FAILED",
         "target": "ideas_mining/digest.py",
         "detail": "No-text and max_tokens-truncated model responses are persisted as complete digests.",
-        "traces_to": ["INV-5", "INV-10", "INV-11"]
+        "traces_to": [
+          "INV-5",
+          "INV-10",
+          "INV-11"
+        ]
       },
       {
         "id": "FINDING-2.8",
         "status": "FAILED",
         "target": "ideas_mining/digest.py",
         "detail": "The prompt and persisted cluster_ids come from two independent ranking queries and can disagree.",
-        "traces_to": ["INV-5", "INV-10"]
+        "traces_to": [
+          "INV-5",
+          "INV-10"
+        ]
       },
       {
         "id": "FINDING-2.9",
         "status": "FAILED",
         "target": "ideas_mining/enrich.py",
         "detail": "If tracking persistence fails after Anthropic accepts a batch, the recoverable batch ID is neither persisted nor logged.",
-        "traces_to": ["DECISION-2.3", "INV-5"]
+        "traces_to": [
+          "DECISION-2.3",
+          "INV-5"
+        ]
       },
       {
         "id": "FINDING-2.10",
         "status": "FAILED",
         "target": "ideas_mining/ingest/hackernews.py",
         "detail": "A missing, malformed, or non-string created_at aborts the HN query and loses partial progress.",
-        "traces_to": ["INV-3", "INV-5"]
+        "traces_to": [
+          "INV-3",
+          "INV-5"
+        ]
       },
       {
         "id": "FINDING-2.11",
         "status": "FAILED",
         "target": "ideas_mining/ingest/reddit.py",
         "detail": "One submission or comment-expansion error aborts its subreddit and discards later submissions.",
-        "traces_to": ["INV-3", "INV-5"]
+        "traces_to": [
+          "INV-3",
+          "INV-5"
+        ]
       },
       {
         "id": "FINDING-2.12",
         "status": "FAILED",
         "target": "ideas_mining/cluster.py",
         "detail": "Live PostgreSQL rejects recluster_all's TRUNCATE because enriched_signals references clusters.",
-        "traces_to": ["INV-2", "INV-5"]
+        "traces_to": [
+          "INV-2",
+          "INV-5"
+        ]
       },
       {
         "id": "FINDING-2.13",
         "status": "FAILED",
         "target": "docker-compose.yml",
         "detail": "PostgreSQL and Redis publish default ports on all interfaces instead of loopback.",
-        "traces_to": ["DECISION-2.10", "INV-5"]
+        "traces_to": [
+          "DECISION-2.10",
+          "INV-5"
+        ]
       },
       {
         "id": "FINDING-2.14",
         "status": "FAILED",
         "target": "ideas_mining/worker.py",
         "detail": "An unknown or whitespace-padded LOG_LEVEL raises ValueError during worker startup.",
-        "traces_to": ["INV-5"]
+        "traces_to": [
+          "INV-5"
+        ]
       },
       {
         "id": "FINDING-2.15",
         "status": "BLOCKER",
         "target": "manual LLM and digest acceptance criteria",
         "detail": "Pain-point normalization, vertical disagreements, and digest usefulness still require human review of actual model output.",
-        "traces_to": ["OQ-6", "INV-1", "INV-10"]
+        "traces_to": [
+          "OQ-6",
+          "INV-1",
+          "INV-10"
+        ]
       }
     ],
     "coderabbit": {
@@ -359,100 +366,20 @@
   },
   "open_blockers": [
     {
+      "id": "TEST-CONFLICT-3.1",
+      "severity": "FAILED",
+      "target": "tests/test_migration_and_infra_contract.py",
+      "detail": "test_hnsw_migration_uses_cosine_operator_class and test_deferred_hnsw_migration_is_not_alembic_head cannot both pass. The first reads migrations/versions/0002_hnsw_indexes.py by hard-coded path; the second requires Alembic's head to be 0001. Alembic loads every .py in a scanned version location and raises CommandError on any lacking a `revision` attribute, and it does not recurse into subdirectories - so a revision file in versions/ is necessarily in the chain and necessarily the head. FINDING-2.5 is fixed; the path assertion must follow the file to migrations/deferred/0002_hnsw_indexes.py. Not edited by the Builder: Validator-owned file.",
+      "traces_to_decision": "DECISION-3.2",
+      "needs": "validator"
+    },
+    {
       "id": "OQ-6",
       "severity": "BLOCKER",
       "target": ".spec/system_spec.md",
-      "detail": "Manual LLM and digest quality criteria have no assertion form.",
+      "detail": "Manual LLM and digest quality criteria have no assertion form. Unchanged since cycle 1 and still the criteria that actually decide whether the system works.",
       "traces_to_decision": null,
       "needs": "human"
-    },
-    {
-      "id": "FINDING-2.4",
-      "severity": "FAILED",
-      "target": "pyproject.toml",
-      "detail": "Declare greenlet or SQLAlchemy's asyncio extra.",
-      "traces_to_decision": "DECISION-2.11",
-      "needs": "builder"
-    },
-    {
-      "id": "FINDING-2.5",
-      "severity": "FAILED",
-      "target": "migrations/versions/0002_hnsw_indexes.py",
-      "detail": "Make deferred-index behavior compatible with the documented Alembic command.",
-      "traces_to_decision": "DECISION-2.8",
-      "needs": "builder"
-    },
-    {
-      "id": "FINDING-2.6",
-      "severity": "FAILED",
-      "target": "ideas_mining/digest.py",
-      "detail": "Enforce source URLs before digest persistence.",
-      "traces_to_decision": null,
-      "needs": "builder"
-    },
-    {
-      "id": "FINDING-2.7",
-      "severity": "FAILED",
-      "target": "ideas_mining/digest.py",
-      "detail": "Reject empty and max_tokens-truncated model output.",
-      "traces_to_decision": null,
-      "needs": "builder"
-    },
-    {
-      "id": "FINDING-2.8",
-      "severity": "FAILED",
-      "target": "ideas_mining/digest.py",
-      "detail": "Persist the cluster IDs from the ranking used to build model input.",
-      "traces_to_decision": null,
-      "needs": "builder"
-    },
-    {
-      "id": "FINDING-2.9",
-      "severity": "FAILED",
-      "target": "ideas_mining/enrich.py",
-      "detail": "Log the accepted batch ID at error level if its tracking insert fails.",
-      "traces_to_decision": "DECISION-2.3",
-      "needs": "builder"
-    },
-    {
-      "id": "FINDING-2.10",
-      "severity": "FAILED",
-      "target": "ideas_mining/ingest/hackernews.py",
-      "detail": "Isolate malformed timestamps to one HN hit.",
-      "traces_to_decision": null,
-      "needs": "builder"
-    },
-    {
-      "id": "FINDING-2.11",
-      "severity": "FAILED",
-      "target": "ideas_mining/ingest/reddit.py",
-      "detail": "Isolate individual Reddit submission errors and persist partial progress.",
-      "traces_to_decision": null,
-      "needs": "builder"
-    },
-    {
-      "id": "FINDING-2.12",
-      "severity": "FAILED",
-      "target": "ideas_mining/cluster.py",
-      "detail": "Replace the FK-prohibited cluster truncate with a constraint-safe clear.",
-      "traces_to_decision": null,
-      "needs": "builder"
-    },
-    {
-      "id": "FINDING-2.13",
-      "severity": "FAILED",
-      "target": "docker-compose.yml",
-      "detail": "Bind PostgreSQL and Redis published ports to loopback.",
-      "traces_to_decision": "DECISION-2.10",
-      "needs": "builder"
-    },
-    {
-      "id": "FINDING-2.14",
-      "severity": "FAILED",
-      "target": "ideas_mining/worker.py",
-      "detail": "Normalize and safely default an invalid LOG_LEVEL.",
-      "traces_to_decision": null,
-      "needs": "builder"
     }
   ]
 }

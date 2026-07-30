@@ -292,10 +292,18 @@ async def recluster_all() -> None:
     could never say "this cluster grew".
     """
     async with get_session() as session:
-        # enriched_signals.cluster_id references clusters.id, so the FKs have to be
-        # dropped before the truncate — hence CASCADE-free explicit ordering.
         await session.execute(update(EnrichedSignal).values(cluster_id=None))
-        await session.execute(text("TRUNCATE clusters RESTART IDENTITY"))
+        # DELETE, not TRUNCATE (FINDING-2.12). Postgres refuses to TRUNCATE a table
+        # referenced by a foreign key **even when no referencing rows exist** — the
+        # check is on the constraint, not the data — so clearing cluster_id first does
+        # not help. TRUNCATE ... CASCADE would work but would silently truncate
+        # enriched_signals too, destroying every embedding this job is meant to reuse.
+        # DELETE is slower and correct.
+        #
+        # Cluster ids are deliberately not restarted: a rebuilt cluster is genuinely a
+        # different cluster, and reusing ids would make an old digest's cluster_ids
+        # point at unrelated rows.
+        await session.execute(text("DELETE FROM clusters"))
 
     log.warning("recluster_all: cleared all clusters, reassigning from scratch")
     await assign_clusters()

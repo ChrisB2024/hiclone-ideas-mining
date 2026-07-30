@@ -4,14 +4,22 @@ Revision ID: 0002
 Revises: 0001
 Create Date: 2026-07-28
 
-**Written but deliberately not applied by default.** An hnsw index built on an empty
-table has useless statistics and has to be rebuilt anyway. Run this once there are a few
-thousand signals::
+**This file lives outside `migrations/versions/` on purpose (FINDING-2.5).**
 
-    alembic upgrade 0002
+Alembic only scans the directories named in `version_locations`, and it does not
+recurse. Keeping this revision in `versions/` made it the chain head, so the ordinary
+`alembic upgrade head` applied it — building both hnsw indexes on empty tables, which
+is the exact thing the deferral exists to avoid. A docstring saying "deferred" does not
+defer anything; being outside the scanned path does.
 
-Until then, `alembic upgrade 0001` is the correct head, and sequential scans over a few
-hundred centroids are fast.
+So there are two configs, and which one you run *is* the decision:
+
+    alembic upgrade head                          # 0001 only. The default.
+    alembic -c alembic.deferred.ini upgrade head  # adds the indexes. Once, later.
+
+Run the second once there are a few thousand signals. Until then sequential scans over
+a few hundred centroids are fast, and an hnsw graph built on an empty table is
+optimised for nothing — its shape is fixed at build time from the rows present.
 
 ``vector_cosine_ops``, NOT the L2 default. Voyage embeddings are normalized for cosine
 similarity, and the wrong operator class does not error — it silently returns worse

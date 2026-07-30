@@ -74,6 +74,23 @@ async def ingest_all(ctx: dict[str, Any] | None = None) -> dict[str, Any]:
     return summary
 
 
+def resolve_log_level(raw: str) -> int:
+    """Turn a configured log level into a level number, falling back to INFO.
+
+    Inputs:
+        raw: whatever LOG_LEVEL contained — possibly padded, mis-cased, or nonsense.
+
+    Returns:
+        A logging level integer. Unknown names give ``logging.INFO``.
+
+    FINDING-2.14: ``logging.basicConfig(level="not-a-level")`` raises, and it raises
+    inside ``on_startup`` — so a single typo in ``.env`` stops the worker booting at
+    all. Logging configuration is the last thing that should be able to take the
+    pipeline down; it is diagnostics, not a dependency.
+    """
+    return logging.getLevelNamesMapping().get(raw.strip().upper(), logging.INFO)
+
+
 async def startup(ctx: dict[str, Any]) -> None:
     """Configure logging. The DB engine is created lazily on first use.
 
@@ -83,10 +100,14 @@ async def startup(ctx: dict[str, Any]) -> None:
     that imports it, including the test runner.
     """
     logging.basicConfig(
-        level=settings.log_level.upper(),
+        level=resolve_log_level(settings.log_level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    log.info("worker starting (enrich=%s, embed=%s)", settings.enrich_model, settings.embed_model)
+    log.info(
+        "worker starting (enrich=%s, embed=%s)",
+        settings.enrich_model,
+        settings.embed_model,
+    )
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:

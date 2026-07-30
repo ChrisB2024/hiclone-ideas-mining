@@ -596,3 +596,191 @@ The human's instruction was explicit: implement the TODOs, no scaffolding this c
   never be observable; a 1970 date in a digest means the recompute didn't run.
 - Blockers: none `needs: builder`. `OQ-6` remains `needs: human`. `OQ-2`/`OQ-3` are
   unblocked but unverified — **nothing in this cycle has touched a real database.**
+
+---
+
+## Session 3 — 2026-07-30 — FIX CYCLE-2 VALIDATION FINDINGS
+
+### Context
+Reading from: `handoff.json` (turn=claude, status=VALIDATION_COMPLETE, cycle 3), Codex
+session 2 in full. Addressing from Codex: eleven `FAILED` findings, all `needs: builder`
+— `FINDING-2.4` through `FINDING-2.14`. Building: fixes only, no new features.
+
+Codex got a live Postgres+pgvector running this cycle, which is the first time anything
+here has been tested against a real database. **`FINDING-2.1` is the one that matters:
+the INV-2 partition test passes both halves** — the vertical clause partitions, and the
+same query with the clause removed merges the fixture. That invariant is no longer
+taken on faith.
+
+### Decisions
+
+#### [DECISION-3.1] `sqlalchemy[asyncio]` instead of bare `sqlalchemy` — FINDING-2.4
+- **What:** dependency changed to pull in the asyncio extra.
+- **Why:** SQLAlchemy's async layer needs `greenlet` at runtime and does not install it
+  by default. A clean checkout installed cleanly and then failed the moment Alembic or
+  any stage opened an async connection.
+- **[CONCEPT] Why greenlet is there at all:** SQLAlchemy's core is synchronous code
+  written over many years. Rather than rewrite it, the async layer runs that sync code
+  inside a *greenlet* — a lightweight coroutine that can be paused mid-call — so when
+  the sync code reaches a blocking database call, the greenlet suspends and hands
+  control back to the event loop. It's a bridge between two calling conventions. The
+  relevant part is that it's a hard runtime requirement hiding behind an optional
+  extra, so it fails on someone else's machine rather than yours.
+
+#### [DECISION-3.2] Deferred migration moved out of `migrations/versions/` — FINDING-2.5
+- **What:** `0002_hnsw_indexes.py` now lives in `migrations/deferred/`, with a second
+  config `alembic.deferred.ini` whose `version_locations` includes both directories.
+  `alembic upgrade head` → 0001 only. `alembic -c alembic.deferred.ini upgrade head` →
+  applies the two cosine indexes.
+- **Why:** Codex was right and my cycle-2 reasoning was wrong. I deferred the indexes
+  with a docstring. Alembic doesn't read docstrings — 0002 was the chain head, so the
+  ordinary `alembic upgrade head` built both hnsw indexes on empty tables, which is
+  precisely what the deferral existed to prevent.
+- **[CONCEPT] A comment is not a mechanism.** This is the general lesson, not an
+  Alembic detail. If the safe path and the dangerous path are the same command, and the
+  only thing separating them is prose in a file, then the dangerous one is the default
+  and the prose is decoration. Making it structural — the file is not in the scanned
+  directory, so the tool *cannot* apply it — is what actually defers it. Alembic only
+  scans the directories in `version_locations` and does not recurse into
+  subdirectories, so location is a real boundary.
+- **Also fixed while here:** Alembic 1.18 replaced `version_path_separator` with
+  `path_separator`. Without it, `version_locations` was parsed as one path containing a
+  space and the deferred config silently found zero revisions.
+- **Tradeoff:** two ini files. The asymmetry is the point — you have to *choose* the
+  dangerous one.
+
+#### [DECISION-3.3] `validate_model_output` gate before persistence — FINDING-2.6/2.7
+- **What:** `send_digest` refuses prose that is empty, that stopped at `max_tokens`, or
+  that contains no `http(s)://` anywhere. Raised before the `digests` row is written.
+- **Why:** all three fail while nothing raises, and all three are unrecoverable once
+  persisted — the next run's `period_start` moves past the window, so the week's
+  content is gone without a manual date fix. The URL check is INV-10 in code: the
+  thread authors are the leads, and a digest that reads beautifully with no links has
+  failed at its actual job. It is the failure most likely to go unnoticed, because the
+  prose is equally persuasive either way.
+- **Tradeoff:** a bad week now costs one Sonnet call and an empty inbox, rather than a
+  plausible-looking digest. That's the right direction.
+
+#### [DECISION-3.4] `gather_digest_input` returns `(prompt, cluster_ids)` — FINDING-2.8
+- **What:** the ids come back from the function that built the prompt, instead of being
+  re-derived by a second `top_clusters` call after the model returns.
+- **Why:** ranking twice meant `score_clusters` running in between could change the
+  answer, and the `digests` row would archive a different set of clusters than the
+  prose it stores describes. Nothing would reveal it — both lists look reasonable
+  alone.
+- **[CONCEPT] Read-twice bugs.** Any time you ask the same question twice and assume
+  the same answer, you've made a concurrency assumption. Here the two reads were ten
+  seconds and one network round-trip apart, with a weekly cron in between them.
+
+#### [DECISION-3.5] Batch id logged at ERROR if its tracking row fails — FINDING-2.9
+- **What:** the `enrichment_batches` insert is wrapped; on failure the accepted batch
+  id goes to the log at ERROR and the exception re-raises.
+- **Why:** between the API accepting the batch and that row committing, the batch
+  exists and is being billed but nothing in the system knows its id. Lose that window
+  and the results are unreachable *and* the next tick re-submits the same posts. The
+  log line is the only recovery path.
+
+#### [DECISION-3.6] Three nested failure domains in Reddit ingest — FINDING-2.11
+- **What:** per-submission, per-comment-tree, and per-listing try/except; the upsert
+  runs regardless so partial progress persists.
+- **Why:** I isolated failures at the *target* level in cycle 2 and stopped there. One
+  bad submission still discarded every row already collected from that subreddit,
+  including the good ones ahead of it in the listing. Reddit objects are assembled from
+  user content and any attribute access can raise.
+
+#### [DECISION-3.7] `_parse_created_at` returns None instead of raising — FINDING-2.10
+- **What:** a missing, null, non-string, or unparseable HN timestamp drops that one hit.
+- **Why:** the old expression could raise `KeyError`, `AttributeError`, or `TypeError`
+  depending on which way the field was malformed, and each escaped `ingest_hn_query`
+  and discarded the whole page. A third party's bad field should cost one row.
+
+#### [DECISION-3.8] `DELETE FROM clusters`, not `TRUNCATE` — FINDING-2.12
+- **What:** `recluster_all` clears the table with DELETE.
+- **Why:** Postgres refuses to TRUNCATE a table referenced by a foreign key **even when
+  no referencing rows exist** — the check is on the constraint, not the data — so
+  nulling `cluster_id` first doesn't help. My cycle-2 comment claiming otherwise was
+  simply wrong, and only a live database could catch it.
+- **Why not CASCADE:** `TRUNCATE ... CASCADE` would have worked and would also have
+  truncated `enriched_signals`, destroying every embedding the rebuild exists to reuse.
+  That is a genuinely expensive wrong answer sitting one keyword away from the right
+  one.
+- **Ids are not restarted:** a rebuilt cluster is a different cluster, and reusing ids
+  would make an old digest's `cluster_ids` point at unrelated rows.
+
+#### [DECISION-3.9] Compose ports bound to loopback — FINDING-2.13
+- **What:** `127.0.0.1:5432:5432` and `127.0.0.1:6379:6379`.
+- **Why:** `"5432:5432"` publishes on every interface. On a cafe or office network that
+  exposes a database of scraped post bodies and author names behind the password
+  `postgres`, and a Redis with no password at all.
+
+#### [DECISION-3.10] `resolve_log_level` falls back to INFO — FINDING-2.14
+- **What:** whitespace-stripped, upper-cased, looked up in
+  `logging.getLevelNamesMapping()`, defaulting to INFO.
+- **Why:** `basicConfig(level="not-a-level")` raises, and it raises inside
+  `on_startup` — so one typo in `.env` stops the worker booting. Logging is
+  diagnostics; it should never be able to take the pipeline down.
+
+### Work Done
+- `pyproject.toml` — `sqlalchemy[asyncio]`.
+- `alembic.ini` — `path_separator`, and a note on why `version_locations` is default.
+- `alembic.deferred.ini` — new; the only config that can see `migrations/deferred/`.
+- `migrations/versions/0002_hnsw_indexes.py` → `migrations/deferred/0002_hnsw_indexes.py`.
+- `ideas_mining/digest.py` — `validate_model_output`, `_URL_RE`, tuple return from
+  `gather_digest_input`, validation before persistence.
+- `ideas_mining/enrich.py` — batch-id recovery logging.
+- `ideas_mining/ingest/reddit.py` — nested failure domains.
+- `ideas_mining/ingest/hackernews.py` — `_parse_created_at`.
+- `ideas_mining/cluster.py` — DELETE instead of TRUNCATE.
+- `ideas_mining/worker.py` — `resolve_log_level`.
+- `docker-compose.yml` — loopback binds.
+
+### Invariants Verified
+- [x] INV-10 — now enforced rather than documented: no URL, no digest.
+- [x] INV-11 — unchanged; validation happens *before* the write, so the ordering
+      guarantee is untouched and a rejected digest writes nothing at all.
+- [x] INV-2 — confirmed by Codex against a live database (`FINDING-2.1`), both halves.
+- [x] INV-5 — improved: ingest now persists partial progress instead of discarding a
+      run on one bad record.
+
+### Security Considerations
+- Loopback binds are the substantive change (`DECISION-3.9`).
+- The new broad `except Exception` handlers in ingest log the exception and continue.
+  They surround third-party object access only, never a write path, and every one logs
+  at WARNING with the subreddit and id — a silently swallowed exception here would be
+  worse than the crash it replaces.
+
+### Open Questions
+- **`test_hnsw_migration_uses_cosine_operator_class` and
+  `test_deferred_hnsw_migration_is_not_alembic_head` cannot both pass.** The first reads
+  `migrations/versions/0002_hnsw_indexes.py` by hard-coded path; the second requires
+  Alembic's head to be `0001`. Alembic loads *every* `.py` in a scanned version
+  location and raises `CommandError` on any that lacks a `revision` attribute, and it
+  does not recurse into subdirectories — so a revision file in `versions/` is
+  necessarily part of the chain and necessarily the head. I fixed the finding and left
+  the path assertion failing rather than edit a Validator-owned file. **Codex should
+  point that test at `migrations/deferred/0002_hnsw_indexes.py`, or glob for the file.**
+- `OQ-6` unchanged, still `needs: human`.
+
+### Handoff
+- Status: READY_FOR_VALIDATION
+- Suite: **71 passed, 1 failed, 12 skipped.** The single failure is the path constant
+  above, not a source defect.
+- Codex should test:
+  1. `validate_model_output` directly — empty, whitespace-only, `max_tokens`, and
+     no-URL cases, plus that a valid digest with one URL passes.
+  2. That a rejected digest writes **nothing**: no `digests` row, no file, no SMTP.
+  3. `gather_digest_input`'s returned ids match the clusters actually named in its
+     prompt text.
+  4. `alembic upgrade head` applies zero hnsw indexes;
+     `alembic -c alembic.deferred.ini upgrade head` applies exactly two, both
+     `vector_cosine_ops`.
+  5. `recluster_all` against live Postgres — the FK case that broke TRUNCATE, and that
+     embeddings survive the rebuild.
+  6. Reddit ingest: a failing submission, a failing comment tree, and a listing that
+     raises mid-iteration all preserve the rows collected before them.
+  7. `_parse_created_at` across missing / null / numeric / unparseable / naive inputs;
+     assert the naive case comes back UTC-attached rather than dropped.
+  8. `resolve_log_level` on padding, case, unknown names, and numeric strings.
+  9. `submit_enrichment` logs the batch id at ERROR when the tracking insert fails, and
+     still raises.
+- Blockers: none `needs: builder`. `OQ-6` remains `needs: human`.

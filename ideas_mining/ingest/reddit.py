@@ -120,55 +120,78 @@ async def ingest_subreddit(
     rows: list[dict[str, Any]] = []
 
     try:
-        sub = await client.subreddit(subreddit)
-        async for submission in sub.new(limit=settings.posts_per_subreddit):
-            created = _created_at(submission.created_utc)
-            if created < window_start:
-                # `new` is newest-first, so everything past here is older still and
-                # already stored. Breaking rather than continuing is what keeps a
-                # 12h window cheap on a subreddit with years of history.
-                break
+        # FINDING-2.11: three nested failure domains, deliberately. Reddit is a
+        # third-party API returning objects assembled from user content, and any single
+        # attribute access can raise. Before this, one bad submission — or one comment
+        # tree that failed to expand — discarded every row already collected from the
+        # subreddit, including the good ones ahead of it in the listing.
+        try:
+            sub = await client.subreddit(subreddit)
+            async for submission in sub.new(limit=settings.posts_per_subreddit):
+                try:
+                    created = _created_at(submission.created_utc)
+                    if created < window_start:
+                        # `new` is newest-first, so everything past here is older
+                        # still and already stored. Breaking rather than continuing
+                        # is what keeps a 12h window cheap on a subreddit with years
+                        # of history.
+                        break
 
-            rows.append({
-                "source": SOURCE,
-                "external_id": submission.fullname,
-                "parent_external_id": None,
-                "subsource": str(submission.subreddit),
-                "vertical_hint": vertical_hint,
-                "url": f"https://reddit.com{submission.permalink}",
-                "author": _author_name(submission.author),
-                "title": submission.title,
-                "body": submission.selftext or "",
-                "score": submission.score,
-                "created_at": created,
-            })
+                    rows.append({
+                        "source": SOURCE,
+                        "external_id": submission.fullname,
+                        "parent_external_id": None,
+                        "subsource": str(submission.subreddit),
+                        "vertical_hint": vertical_hint,
+                        "url": f"https://reddit.com{submission.permalink}",
+                        "author": _author_name(submission.author),
+                        "title": submission.title,
+                        "body": submission.selftext or "",
+                        "score": submission.score,
+                        "created_at": created,
+                    })
+                except Exception as exc:
+                    log.warning("r/%s: skipping a submission: %s", subreddit, exc)
+                    continue
 
-            # limit=0 removes the "load more comments" placeholders instead of
-            # expanding them. The long tail is low-signal and each expansion is a
-            # separate API round trip.
-            await submission.comments.replace_more(limit=0)
-            top_level = sorted(
-                submission.comments,
-                key=lambda c: getattr(c, "score", 0),
-                reverse=True,
-            )[: settings.comments_per_post]
+                # Comments are a separate domain from their submission: losing a
+                # comment tree must not lose the submission row already collected.
+                try:
+                    # limit=0 removes the "load more comments" placeholders instead
+                    # of expanding them. The long tail is low-signal and each
+                    # expansion is a separate API round trip.
+                    await submission.comments.replace_more(limit=0)
+                    top_level = sorted(
+                        submission.comments,
+                        key=lambda c: getattr(c, "score", 0),
+                        reverse=True,
+                    )[: settings.comments_per_post]
 
-            for comment in top_level:
-                rows.append({
-                    "source": SOURCE,
-                    "external_id": comment.fullname,
-                    "parent_external_id": submission.fullname,
-                    "subsource": str(submission.subreddit),
-                    # Inherited, never recomputed — a comment is about whatever its
-                    # submission's forum is about.
-                    "vertical_hint": vertical_hint,
-                    "url": f"https://reddit.com{comment.permalink}",
-                    "author": _author_name(comment.author),
-                    "title": None,
-                    "body": comment.body or "",
-                    "score": getattr(comment, "score", 0),
-                    "created_at": _created_at(comment.created_utc),
-                })
+                    for comment in top_level:
+                        rows.append({
+                            "source": SOURCE,
+                            "external_id": comment.fullname,
+                            "parent_external_id": submission.fullname,
+                            "subsource": str(submission.subreddit),
+                            # Inherited, never recomputed — a comment is about
+                            # whatever its submission's forum is about.
+                            "vertical_hint": vertical_hint,
+                            "url": f"https://reddit.com{comment.permalink}",
+                            "author": _author_name(comment.author),
+                            "title": None,
+                            "body": comment.body or "",
+                            "score": getattr(comment, "score", 0),
+                            "created_at": _created_at(comment.created_utc),
+                        })
+                except Exception as exc:
+                    log.warning(
+                        "r/%s: comments unavailable for %s: %s",
+                        subreddit, getattr(submission, "fullname", "?"), exc,
+                    )
+        except Exception as exc:
+            # The listing itself died (rate limit, private sub, network). Fall through
+            # to the upsert so the rows already fetched are not thrown away.
+            log.warning("r/%s: listing ended early: %s", subreddit, exc)
     finally:
         if owns_client:
             await client.close()

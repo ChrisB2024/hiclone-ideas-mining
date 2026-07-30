@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import smtplib
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
@@ -94,8 +95,10 @@ def heading_for(vertical: str) -> str:
     return f"## {vertical.replace('_', ' ').upper()}"
 
 
-async def gather_digest_input(period_start: datetime, period_end: datetime) -> str:
-    """Build the plain-text block for the model.
+async def gather_digest_input(
+    period_start: datetime, period_end: datetime
+) -> tuple[str, list[int]]:
+    """Build the plain-text block for the model, and the cluster ids it was built from.
 
     Inputs:
         period_start, period_end: the reporting window, used only for the label — the
@@ -103,7 +106,14 @@ async def gather_digest_input(period_start: datetime, period_end: datetime) -> s
             filtered to the window.
 
     Returns:
-        The user-turn text: two labelled sections, clusters in rank order.
+        ``(prompt_text, cluster_ids)`` — the user-turn text, and the ids of the
+        clusters actually in it, insurance in rank order then real estate.
+
+    FINDING-2.8: the ids are returned rather than re-queried by the caller. Ranking
+    twice meant ``score_clusters`` running in between could change the result, and the
+    ``digests`` row would then archive a different set of clusters than the prose it
+    stores describes — with nothing to reveal the mismatch, since both lists look
+    perfectly reasonable on their own.
 
     Top ``DIGEST_CLUSTERS_PER_VERTICAL`` clusters per vertical via
     ``score.top_clusters``, grouped under ``## INSURANCE`` / ``## REAL ESTATE``.
@@ -127,10 +137,12 @@ async def gather_digest_input(period_start: datetime, period_end: datetime) -> s
         f"Reporting period: {period_start:%Y-%m-%d} to {period_end:%Y-%m-%d}",
         "",
     ]
+    cluster_ids: list[int] = []
 
     async with get_session() as session:
         for vertical in VERTICAL_NAMES:
             clusters = await top_clusters(vertical, DIGEST_CLUSTERS_PER_VERTICAL)
+            cluster_ids.extend(int(cluster["id"]) for cluster in clusters)
             parts.append(heading_for(vertical))
 
             if not clusters:
@@ -177,7 +189,7 @@ async def gather_digest_input(period_start: datetime, period_end: datetime) -> s
 
             parts.append("")
 
-    return "\n".join(parts)
+    return "\n".join(parts), cluster_ids
 
 
 async def render_header(period_start: datetime, period_end: datetime) -> str:
@@ -225,6 +237,49 @@ async def render_header(period_start: datetime, period_end: datetime) -> str:
         )
     lines.append("")
     return "\n".join(lines)
+
+
+#: Any http(s) link. Deliberately crude — this checks that the model kept its links at
+#: all, not that they resolve.
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def validate_model_output(prose: str, stop_reason: str | None) -> None:
+    """Refuse digest prose that is empty, truncated, or stripped of its source links.
+
+    Inputs:
+        prose: the concatenated text blocks from the model.
+        stop_reason: the response's stop reason, if the SDK reported one.
+
+    Raises:
+        ValueError: on any of the three failures below. The caller has not persisted
+            anything yet, so raising loses a Sonnet call and nothing else.
+
+    Three ways the digest can fail while nothing raises (FINDING-2.6, FINDING-2.7):
+
+    * **Empty output.** Persisting it archives a blank week and sets ``delivered``,
+      and the next run's ``period_start`` moves past the window — so the content isn't
+      just missing, it's unrecoverable without a manual date fix.
+    * **``stop_reason == "max_tokens"``.** The prose ends mid-sentence, usually inside
+      the real-estate section, because that section comes second. The digest looks
+      complete for insurance and silently drops the vertical it was cut off in.
+    * **No source URL anywhere.** This is INV-10. The thread authors are the leads; a
+      pain point without a link is trivia. A digest that reads beautifully and contains
+      no URLs has failed at its actual job, and it is the failure most likely to go
+      unnoticed, because the prose is exactly as persuasive either way.
+    """
+    if not prose.strip():
+        raise ValueError("digest model returned no text; refusing to persist it")
+
+    if stop_reason == "max_tokens":
+        raise ValueError(
+            "digest was truncated at max_tokens; refusing to persist a partial digest"
+        )
+
+    if not _URL_RE.search(prose):
+        raise ValueError(
+            "digest contains no source URL (INV-10); refusing to persist it"
+        )
 
 
 def _write_file(markdown: str, period_end: datetime) -> Path:
@@ -310,7 +365,15 @@ async def send_digest(ctx: dict[str, object] | None = None) -> int:
 
     period_start = previous_end or (period_end - timedelta(days=7))
 
-    body = await gather_digest_input(period_start, period_end)
+    gathered = await gather_digest_input(period_start, period_end)
+    # gather_digest_input returns (prompt, cluster_ids). The bare-string form is
+    # tolerated so a caller that assembles its own prompt — a manual re-run over a
+    # hand-edited block — doesn't have to fabricate an id list.
+    if isinstance(gathered, tuple):
+        body, cluster_ids = gathered
+    else:
+        body, cluster_ids = gathered, []
+
     header = await render_header(period_start, period_end)
 
     client = AsyncAnthropic(api_key=settings.anthropic_api_key)
@@ -328,12 +391,12 @@ async def send_digest(ctx: dict[str, object] | None = None) -> int:
         block.text for block in response.content
         if getattr(block, "type", None) == "text"
     )
-    markdown = f"{header}\n{prose}\n"
 
-    cluster_ids: list[int] = []
-    for vertical in VERTICAL_NAMES:
-        clusters = await top_clusters(vertical, DIGEST_CLUSTERS_PER_VERTICAL)
-        cluster_ids.extend(int(cluster["id"]) for cluster in clusters)
+    # Before anything is written. A bad digest costs one Sonnet call to discard and a
+    # whole week to recover from once it has been archived and marked delivered.
+    validate_model_output(prose, getattr(response, "stop_reason", None))
+
+    markdown = f"{header}\n{prose}\n"
 
     # Written before delivery is attempted. Everything after this point can fail
     # without losing the digest.

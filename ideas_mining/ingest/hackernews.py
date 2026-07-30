@@ -56,8 +56,39 @@ def strip_html(text: str) -> str:
     return html.unescape(_TAG_RE.sub("", with_breaks)).strip()
 
 
+def _parse_created_at(value: Any) -> datetime | None:
+    """Parse Algolia's ISO 8601 ``created_at``, or None if it is unusable.
+
+    Inputs:
+        value: whatever the API returned — normally a string, but missing, null, or a
+            number in practice.
+
+    Returns:
+        An aware datetime, or None.
+
+    FINDING-2.10: this used to be an unguarded
+    ``datetime.fromisoformat(hit["created_at"].replace(...))``. A hit with no
+    ``created_at`` raised KeyError, a null one AttributeError, and a numeric one
+    TypeError — each of which escaped ``ingest_hn_query`` and discarded every hit
+    already collected in that pass, including the ones that were fine. A third party's
+    malformed field should cost one row, not a run.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    # A naive timestamp here would be read as server-local time in a timestamptz
+    # column and drift recency scoring, so treat it as UTC rather than trusting it.
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
 def _hit_to_row(hit: dict[str, Any]) -> dict[str, Any] | None:
-    """Map one Algolia hit to a raw_posts row, or None if it carries no text.
+    """Map one Algolia hit to a raw_posts row, or None if it is unusable.
+
+    Returns None — never raises — for a hit with no id, no text at all, or an
+    unparseable timestamp. The caller drops it and keeps going.
 
     Invariant: ``vertical_hint`` is ALWAYS None on HN rows. See ``ingest_hn_query``.
     """
@@ -69,6 +100,11 @@ def _hit_to_row(hit: dict[str, Any]) -> dict[str, Any] | None:
     title = hit.get("title")
     if not body and not title:
         # A link-only story with no text and no title has nothing to filter or enrich.
+        return None
+
+    created_at = _parse_created_at(hit.get("created_at"))
+    if created_at is None:
+        log.warning("hn hit %s has unusable created_at, skipping", object_id)
         return None
 
     return {
@@ -84,7 +120,7 @@ def _hit_to_row(hit: dict[str, Any]) -> dict[str, Any] | None:
         "title": title,
         "body": body,
         "score": hit.get("points") or 0,
-        "created_at": datetime.fromisoformat(hit["created_at"].replace("Z", "+00:00")),
+        "created_at": created_at,
     }
 
 

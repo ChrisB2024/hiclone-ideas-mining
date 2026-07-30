@@ -293,12 +293,27 @@ async def submit_enrichment(ctx: dict[str, object] | None = None) -> str | None:
     finally:
         await client.close()
 
-    async with get_session() as session:
-        session.add(
-            EnrichmentBatch(
-                batch_id=batch.id, status="pending", request_count=len(requests)
+    # FINDING-2.9: between the API accepting the batch and this row committing, the
+    # batch exists and is being billed but nothing in the system knows its id. If the
+    # database is unavailable in that window the id is lost, the results are
+    # unreachable, and the next tick re-submits the same posts — paying twice. The
+    # exception still propagates (the caller must not treat this as a clean submit),
+    # but the id goes to the log at ERROR so the batch can be recovered by hand.
+    try:
+        async with get_session() as session:
+            session.add(
+                EnrichmentBatch(
+                    batch_id=batch.id, status="pending", request_count=len(requests)
+                )
             )
+    except Exception:
+        log.error(
+            "batch %s was ACCEPTED by the API but its tracking row failed to persist. "
+            "Insert it manually into enrichment_batches or the results are orphaned "
+            "and the posts will be re-submitted.",
+            batch.id,
         )
+        raise
 
     log.info("submitted batch %s with %d requests", batch.id, len(requests))
     return batch.id

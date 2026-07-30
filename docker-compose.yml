@@ -18,7 +18,11 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: ideas_mining
     ports:
-      - "5432:5432"
+      # Bound to loopback (FINDING-2.13). A bare "5432:5432" publishes on every
+      # interface, so on a cafe or office network this database — which holds scraped
+      # post bodies and author names — is reachable by anyone on the LAN, behind a
+      # password of "postgres".
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -33,7 +37,8 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      # Loopback for the same reason, and Redis has no password at all.
+      - "127.0.0.1:6379:6379"
     # ARQ keeps only job state here, and every pipeline stage is resumable from
     # Postgres alone — so this is deliberately not persisted. Losing Redis costs at
     # most one cron tick.
