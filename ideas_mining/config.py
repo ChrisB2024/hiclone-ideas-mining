@@ -87,6 +87,14 @@ PAIN_PATTERNS: list[str] = [
 
 MIN_BODY_CHARS = 100
 
+#: Bodies Reddit/HN mark as deleted. Compared case-insensitively against the stripped
+#: body, so a post whose entire content is "[removed]" is rejected before the regexes.
+DELETED_BODIES: frozenset[str] = frozenset({"[deleted]", "[removed]", "[removed by reddit]"})
+
+#: Sent to the enrichment model. Nothing past this changes the extraction, and the tail
+#: of a long rant is its least informative part.
+POST_TEXT_MAX_CHARS = 4000
+
 # ---------------------------------------------------------------------------
 # Scoring weights — specs/05-chunk4-digest.md
 # ---------------------------------------------------------------------------
@@ -96,6 +104,11 @@ WTP_EXPLICIT_WEIGHT = 2.0        # score = ... * (1 + EXPLICIT*ratio + IMPLIED*r
 WTP_IMPLIED_WEIGHT = 0.5
 MIN_DISTINCT_AUTHORS = 2         # below this a cluster is an anecdote — excluded, not zeroed
 DIGEST_CLUSTERS_PER_VERTICAL = 5
+
+#: Members quoted per cluster in the digest, ordered by raw_posts.score DESC — a proxy
+#: for "well articulated and agreed with".
+DIGEST_MEMBERS_PER_CLUSTER = 3
+DIGEST_EXCERPT_CHARS = 300
 
 
 class Settings(BaseSettings):
@@ -123,13 +136,22 @@ class Settings(BaseSettings):
     enrich_model: str = "claude-haiku-4-5"
     digest_model: str = "claude-sonnet-5"
 
+    #: How many raw posts one enrichment batch may carry. The Batch API allows far
+    #: more; the cap keeps a single bad run from spending the whole budget at once.
+    enrich_batch_size: int = 500
+
     voyage_api_key: str = ""
-    # TODO(OQ-1) [BLOCKER]: set the real Voyage model ID and its dimension before
-    # writing the initial Alembic migration. `vector(N)` in the schema must equal
-    # `embedding_dim`, and changing N later invalidates every embedding already
-    # computed. Do NOT guess — verify against Voyage's current docs.
-    embed_model: str = "TODO-SET-VOYAGE-MODEL"
-    embedding_dim: int = 0  # 0 is a deliberate tripwire: models.py refuses to load on it
+    # OQ-1 RESOLVED (cycle 2). Verified against Voyage's model list: voyage-3.5 is
+    # 1024-dimensional by default, 32K context, and supports 256/512/1024/2048.
+    #
+    # The dimension, not the model, is the thing that's expensive to change — vector(N)
+    # is baked into two columns and changing N invalidates every stored embedding. 1024
+    # is the default across the entire current Voyage lineup (voyage-3.5, voyage-3-large,
+    # voyage-4, voyage-4-lite, voyage-code-3, voyage-finance-2), so this schema survives
+    # a model swap as long as the replacement stays at 1024. Verify that before swapping.
+    embed_model: str = "voyage-3.5"
+    embedding_dim: int = 1024
+    embed_batch_size: int = 128
 
     # --- Cluster ------------------------------------------------------------
     # One threshold for BOTH verticals. A per-vertical dict makes the two verticals'
@@ -142,8 +164,14 @@ class Settings(BaseSettings):
     smtp_port: int = 587
     smtp_user: str = ""
     smtp_password: str = ""
+    smtp_starttls: bool = True
     digest_to_address: str = ""
+    #: Falls back to smtp_user when blank — most providers reject a From they don't own.
+    digest_from_address: str = ""
     digest_dir: str = "digests"
+
+    # --- Observability ------------------------------------------------------
+    log_level: str = "INFO"
 
 
 settings = Settings()

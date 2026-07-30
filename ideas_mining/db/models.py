@@ -29,10 +29,14 @@ from ideas_mining.config import ENRICHMENT_VERTICALS, VERTICAL_NAMES, settings
 
 if settings.embedding_dim <= 0:  # pragma: no cover - startup guard
     raise RuntimeError(
-        "settings.embedding_dim is unset (OQ-1). The Voyage model and its dimension "
-        "must be chosen before the schema can be defined — vector(N) is baked into the "
-        "table and changing N later invalidates every stored embedding."
+        "settings.embedding_dim is unset or nonsensical (OQ-1). vector(N) is baked into "
+        "two columns and changing N invalidates every stored embedding, so the schema "
+        "refuses to define itself against a dimension nobody chose. Set EMBEDDING_DIM to "
+        "the Voyage model's real dimension (voyage-3.5 -> 1024)."
     )
+# The guard stays now that OQ-1 is answered: EMBEDDING_DIM is env-overridable, so a
+# typo in .env would otherwise define vector(0) columns and fail much later, in pgvector,
+# with an error that says nothing about where the wrong number came from.
 
 _VERTICAL_SQL = ", ".join(f"'{v}'" for v in VERTICAL_NAMES)
 _ENRICH_VERTICAL_SQL = ", ".join(f"'{v}'" for v in ENRICHMENT_VERTICALS)
@@ -167,13 +171,13 @@ class EnrichedSignal(Base):
         ),
         Index("ix_signals_cluster", "cluster_id"),
         Index("ix_signals_vertical_relevance", "vertical", relevance.desc()),
-        # TODO(chunk 3): add once there are a few thousand rows — an index built on an
-        # empty table has useless statistics. Must be vector_cosine_ops, NOT L2:
-        # Voyage vectors are normalized for cosine, and the wrong opclass degrades
-        # neighbour quality silently rather than erroring.
-        #   Index("ix_signals_embedding", "embedding",
-        #         postgresql_using="hnsw",
-        #         postgresql_ops={"embedding": "vector_cosine_ops"}),
+        # The hnsw index on `embedding` is deliberately NOT declared here. It lives in
+        # migration 0002, which is written and ready but left unapplied on purpose: an
+        # hnsw index built on an empty table has useless statistics. Run it once there
+        # are a few thousand signals (specs/04-chunk3-cluster.md).
+        #
+        # Declaring it in the model instead would make `alembic revision --autogenerate`
+        # want to create it immediately, which is exactly the thing being deferred.
     )
 
 
@@ -219,6 +223,50 @@ class Cluster(Base):
         # the nearest-centroid search, the digest ranking, and manual inspection.
         # No query in the system wants clusters from both verticals at once (INV-9).
         Index("ix_clusters_vertical_score", "vertical", score.desc().nullslast()),
+    )
+
+
+class EnrichmentBatch(Base):
+    """One submitted Anthropic batch, tracked from submit to collect.
+
+    [SPEC_DEVIATION] Not in specs/01-data-model.md. specs/03 requires submit and collect
+    to be two separate ARQ jobs "with the batch id persisted between them" but doesn't
+    say where. A table is the only sink consistent with worker.py's standing rule that
+    all pipeline state lives in Postgres: a module-level variable dies on worker restart
+    and a file on disk is a second source of truth that can disagree with the database.
+
+    Terminal states are absorbing. A batch that reached ``collected`` is never polled
+    again, which is what keeps ``collect_enrichment`` a no-op on an idle system rather
+    than a re-download of every batch ever submitted.
+    """
+
+    __tablename__ = "enrichment_batches"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+
+    #: Anthropic's batch id (``msgbatch_…``). UNIQUE so a retried submit cannot create
+    #: two tracking rows for one batch and double-collect it.
+    batch_id: Mapped[str] = mapped_column(String(128), unique=True)
+
+    #: pending -> collected | failed. Only `pending` rows are polled.
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+
+    #: How many requests went out. Compared against rows written to spot silent losses.
+    request_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    submitted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    collected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'collected', 'failed')",
+            name="ck_enrichment_batches_status",
+        ),
+        Index("ix_enrichment_batches_pending", "status"),
     )
 
 

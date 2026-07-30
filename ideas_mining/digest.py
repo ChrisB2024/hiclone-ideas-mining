@@ -6,7 +6,25 @@ persisted, then delivered.
 
 from __future__ import annotations
 
-from datetime import datetime
+import asyncio
+import logging
+import smtplib
+from datetime import UTC, datetime, timedelta
+from email.message import EmailMessage
+from pathlib import Path
+
+from anthropic import AsyncAnthropic
+from sqlalchemy import select, text, update
+
+from ideas_mining.config import (
+    DIGEST_CLUSTERS_PER_VERTICAL, DIGEST_EXCERPT_CHARS, DIGEST_MEMBERS_PER_CLUSTER,
+    VERTICAL_NAMES, settings,
+)
+from ideas_mining.db.models import Digest
+from ideas_mining.db.session import get_session
+from ideas_mining.score import top_clusters
+
+log = logging.getLogger(__name__)
 
 DIGEST_SYSTEM_PROMPT = """\
 You are briefing a founder who builds LLM tools for two verticals: insurance and real
@@ -32,31 +50,150 @@ Terse. No preamble, no "here's your digest", no closing summary. Markdown.
 # step, in the one artifact that actually gets read. The "only if" and the line cap on
 # BOTH are what stop it being written every week with a strained analogy in it.
 
+#: The 3 most representative members of a cluster: ordered by the post's own score, a
+#: proxy for "well articulated and agreed with".
+CLUSTER_MEMBERS_SQL = """
+SELECT es.pain_point,
+       es.who_has_it,
+       es.current_workaround,
+       es.willingness_to_pay_signal,
+       rp.url,
+       rp.score,
+       left(rp.body, :excerpt_chars) AS excerpt
+FROM enriched_signals es
+JOIN raw_posts rp ON rp.id = es.raw_post_id
+WHERE es.cluster_id = :cluster_id
+ORDER BY rp.score DESC
+LIMIT :n
+"""
+
+#: Header facts. Computed in SQL, never asked of the model.
+PERIOD_STATS_SQL = """
+SELECT es.vertical                              AS vertical,
+       count(*)                                 AS new_signals,
+       count(DISTINCT rp.author)                AS distinct_authors,
+       count(DISTINCT es.cluster_id)            AS clusters
+FROM enriched_signals es
+JOIN raw_posts rp ON rp.id = es.raw_post_id
+WHERE rp.created_at >= :period_start AND rp.created_at < :period_end
+GROUP BY es.vertical
+"""
+
+
+def heading_for(vertical: str) -> str:
+    """Render a vertical name as its digest section heading.
+
+    Inputs:
+        vertical: a key of VERTICALS, e.g. "real_estate".
+
+    Returns:
+        "## REAL ESTATE".
+
+    Derived rather than hardcoded so no module outside config.py names a vertical.
+    """
+    return f"## {vertical.replace('_', ' ').upper()}"
+
 
 async def gather_digest_input(period_start: datetime, period_end: datetime) -> str:
     """Build the plain-text block for the model.
+
+    Inputs:
+        period_start, period_end: the reporting window, used only for the label — the
+            clusters themselves are ranked on all-time score with a recency term, not
+            filtered to the window.
+
+    Returns:
+        The user-turn text: two labelled sections, clusters in rank order.
 
     Top ``DIGEST_CLUSTERS_PER_VERTICAL`` clusters per vertical via
     ``score.top_clusters``, grouped under ``## INSURANCE`` / ``## REAL ESTATE``.
 
     Per cluster: label, score, distinct_authors, member_count, last_seen_at, plus the
-    3 most representative members ``ORDER BY raw_posts.score DESC`` (a proxy for "well
-    articulated and agreed with"), each with pain_point, who_has_it,
-    current_workaround, WTP signal, a <=300-char excerpt, and the url.
+    3 most representative members ``ORDER BY raw_posts.score DESC``, each with
+    pain_point, who_has_it, current_workaround, WTP signal, a <=300-char excerpt, and
+    the url.
 
     If a vertical has fewer than N qualifying clusters, pass what exists and say so in
     the block, e.g. "(only 2 clusters cleared the bar this week)". Do NOT backfill from
     the other vertical to reach 10.
 
     No JSON, no tool use — one call with a fixed shape.
+
+    Security: excerpts are untrusted forum text. They enter the user turn only, and the
+    system prompt is a constant — a hostile excerpt can influence the prose it appears
+    in but cannot reach the database or the delivery path.
     """
-    raise NotImplementedError("TODO")
+    parts: list[str] = [
+        f"Reporting period: {period_start:%Y-%m-%d} to {period_end:%Y-%m-%d}",
+        "",
+    ]
+
+    async with get_session() as session:
+        for vertical in VERTICAL_NAMES:
+            clusters = await top_clusters(vertical, DIGEST_CLUSTERS_PER_VERTICAL)
+            parts.append(heading_for(vertical))
+
+            if not clusters:
+                parts.append("(no clusters cleared the bar this week)")
+                parts.append("")
+                continue
+
+            if len(clusters) < DIGEST_CLUSTERS_PER_VERTICAL:
+                parts.append(
+                    f"(only {len(clusters)} clusters cleared the bar this week)"
+                )
+
+            for rank, cluster in enumerate(clusters, start=1):
+                parts.append(
+                    f"\n{rank}. {cluster['label']}\n"
+                    f"   score={cluster['score']:.3f} "
+                    f"distinct_authors={cluster['distinct_authors']} "
+                    f"member_count={cluster['member_count']} "
+                    f"last_seen={cluster['last_seen_at']:%Y-%m-%d}"
+                )
+
+                members = (
+                    await session.execute(
+                        text(CLUSTER_MEMBERS_SQL),
+                        {
+                            "cluster_id": cluster["id"],
+                            "excerpt_chars": DIGEST_EXCERPT_CHARS,
+                            "n": DIGEST_MEMBERS_PER_CLUSTER,
+                        },
+                    )
+                ).mappings().all()
+
+                for member in members:
+                    workaround = member["current_workaround"] or "not stated"
+                    excerpt = " ".join((member["excerpt"] or "").split())
+                    parts.append(
+                        f"   - pain: {member['pain_point']}\n"
+                        f"     who: {member['who_has_it']}\n"
+                        f"     today: {workaround}\n"
+                        f"     wtp: {member['willingness_to_pay_signal']}\n"
+                        f"     excerpt: {excerpt}\n"
+                        f"     url: {member['url']}"
+                    )
+
+            parts.append("")
+
+    return "\n".join(parts)
 
 
-def render_header(period_start: datetime, period_end: datetime) -> str:
+async def render_header(period_start: datetime, period_end: datetime) -> str:
     """Deterministic, Python-computed header. Prepended to the model's markdown.
 
-    Period, plus a per-vertical line: cluster count / new signals / distinct authors.
+    Inputs:
+        period_start, period_end: the reporting window.
+
+    Returns:
+        A markdown block: period, plus a per-vertical line of cluster count / new
+        signals / distinct authors.
+
+    [SPEC_DEVIATION] Declared synchronous in cycle 1's scaffold. It is a coroutine
+    because the counts are a database aggregate; computing them in the caller and
+    passing them in would just move the same query one frame up and split one fact
+    across two functions.
 
     Never ask the model for a number it can get wrong — it writes the prose, you write
     the facts. These counts are also the weekly health check: if real estate shows 0
@@ -64,11 +201,80 @@ def render_header(period_start: datetime, period_end: datetime) -> str:
     or the 'neither' rate) and you would otherwise not notice, because the digest would
     still arrive looking fine.
     """
-    raise NotImplementedError("TODO")
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                text(PERIOD_STATS_SQL),
+                {"period_start": period_start, "period_end": period_end},
+            )
+        ).mappings().all()
+
+    stats = {row["vertical"]: row for row in rows}
+
+    lines = [
+        f"# Pain digest — {period_start:%Y-%m-%d} to {period_end:%Y-%m-%d}",
+        "",
+    ]
+    for vertical in VERTICAL_NAMES:
+        row = stats.get(vertical)
+        label = vertical.replace("_", " ")
+        lines.append(
+            f"- **{label}** — {row['clusters'] if row else 0} clusters, "
+            f"{row['new_signals'] if row else 0} new signals, "
+            f"{row['distinct_authors'] if row else 0} distinct authors"
+        )
+    lines.append("")
+    return "\n".join(lines)
 
 
-async def send_digest() -> int:
+def _write_file(markdown: str, period_end: datetime) -> Path:
+    """Write the digest to ``digests/YYYY-MM-DD.md``. The sink that cannot fail.
+
+    Returns:
+        The path written.
+
+    Security: the digest contains untrusted excerpts and possibly PII. ``digests/`` is
+    gitignored; the path is derived from a date, never from content.
+    """
+    directory = Path(settings.digest_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{period_end:%Y-%m-%d}.md"
+    path.write_text(markdown, encoding="utf-8")
+    return path
+
+
+def _send_email(markdown: str, period_end: datetime) -> None:
+    """Send the digest over SMTP. Blocking — call via ``asyncio.to_thread``.
+
+    Raises:
+        Whatever smtplib raises. The caller logs and continues; INV-11 requires that a
+        failed send never lose content.
+
+    Security: credentials come from settings and are never logged. The recipient is a
+    single configured address, never taken from post content.
+    """
+    message = EmailMessage()
+    message["Subject"] = f"Pain digest — {period_end:%Y-%m-%d}"
+    message["From"] = settings.digest_from_address or settings.smtp_user
+    message["To"] = settings.digest_to_address
+    message.set_content(markdown)
+
+    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=30) as smtp:
+        if settings.smtp_starttls:
+            smtp.starttls()
+        if settings.smtp_user:
+            smtp.login(settings.smtp_user, settings.smtp_password)
+        smtp.send_message(message)
+
+
+async def send_digest(ctx: dict[str, object] | None = None) -> int:
     """Generate, persist, then deliver. Returns the digests row id.
+
+    Inputs:
+        ctx: ARQ job context, unused (FINDING-1.6).
+
+    Returns:
+        The ``digests.id`` of the row written.
 
     Order is the invariant (INV-11), not an implementation detail::
 
@@ -91,6 +297,77 @@ async def send_digest() -> int:
 
     Security: SMTP credentials come from settings, never appear in the digest or logs.
     The recipient is a single configured address, not user-supplied. Digest text
-    contains untrusted excerpts — do not log the rendered body at INFO.
+    contains untrusted excerpts — the body is never logged at INFO.
     """
-    raise NotImplementedError("TODO")
+    period_end = datetime.now(UTC)
+
+    async with get_session() as session:
+        previous_end = (
+            await session.execute(
+                select(Digest.period_end).order_by(Digest.period_end.desc()).limit(1)
+            )
+        ).scalar_one_or_none()
+
+    period_start = previous_end or (period_end - timedelta(days=7))
+
+    body = await gather_digest_input(period_start, period_end)
+    header = await render_header(period_start, period_end)
+
+    client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+    try:
+        response = await client.messages.create(
+            model=settings.digest_model,
+            max_tokens=8000,
+            system=DIGEST_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": body}],
+        )
+    finally:
+        await client.close()
+
+    prose = "".join(
+        block.text for block in response.content
+        if getattr(block, "type", None) == "text"
+    )
+    markdown = f"{header}\n{prose}\n"
+
+    cluster_ids: list[int] = []
+    for vertical in VERTICAL_NAMES:
+        clusters = await top_clusters(vertical, DIGEST_CLUSTERS_PER_VERTICAL)
+        cluster_ids.extend(int(cluster["id"]) for cluster in clusters)
+
+    # Written before delivery is attempted. Everything after this point can fail
+    # without losing the digest.
+    async with get_session() as session:
+        digest = Digest(
+            period_start=period_start,
+            period_end=period_end,
+            cluster_ids=cluster_ids,
+            markdown=markdown,
+            delivered=False,
+        )
+        session.add(digest)
+        await session.flush()
+        digest_id = digest.id
+
+    path = _write_file(markdown, period_end)
+    log.info("digest %d written to %s (%d clusters)", digest_id, path, len(cluster_ids))
+
+    if not settings.smtp_host or not settings.digest_to_address:
+        log.warning("digest %d: SMTP not configured, file sink only", digest_id)
+        return digest_id
+
+    try:
+        await asyncio.to_thread(_send_email, markdown, period_end)
+    except Exception as exc:
+        # Deliberately swallowed. The content is already in Postgres and on disk; an
+        # unreachable mail server must not turn into a lost week.
+        log.error("digest %d: SMTP delivery failed: %s", digest_id, exc)
+        return digest_id
+
+    async with get_session() as session:
+        await session.execute(
+            update(Digest).where(Digest.id == digest_id).values(delivered=True)
+        )
+
+    log.info("digest %d delivered", digest_id)
+    return digest_id

@@ -18,10 +18,17 @@ dependencies = [
     "voyageai>=0.3",
 ]
 
-# Test dependencies are intentionally absent. Under DADP the Validator owns the test
-# suite and recommends the framework (.agent/prompts/codex_session.md: pytest +
-# pytest-asyncio), but only the Builder may edit this manifest. Add them here when the
-# Validator's recommendation is confirmed.
+# OQ-9 / FINDING-1.9 resolved. The Validator owns the test suite and recommended the
+# framework; only the Builder may edit this manifest, so the recommendation is declared
+# here rather than installed ad hoc. Without this, validation passed on a machine that
+# happened to have pytest and could not be reproduced from a clean checkout.
+#
+#   pip install -e ".[test]"
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
 
 [build-system]
 requires = ["hatchling"]

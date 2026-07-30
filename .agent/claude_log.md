@@ -349,3 +349,250 @@ Do not write behavioural tests for unimplemented functions; assert on what actua
   `OQ-2`, `OQ-3`, `OQ-6`, `OQ-7`. New: **`OQ-9`** — test dependencies are absent from
   `pyproject.toml` by design (`DECISION-1.7`); Codex must file a blocker naming the exact
   deps rather than editing the manifest.
+
+---
+
+## Session 2 — 2026-07-28 — CHUNKS 1-4 IMPLEMENTATION
+
+### Context
+Reading from: `.agent/handoff.json` (turn=claude, status=VALIDATION_COMPLETE), Codex
+session 1 in full, `.spec/system_spec.md`, all eight module specs, `specs/01`–`specs/05`.
+Building: every function in the package — the scaffold's `NotImplementedError` bodies are
+gone. Spec ref: all of `specs/`. Addressing from Codex: `FINDING-1.6`, `FINDING-1.7`
+(both `FAILED`, both `needs: builder`) and `FINDING-1.9` (`BLOCKER`, `OQ-9`).
+
+The human's instruction was explicit: implement the TODOs, no scaffolding this cycle.
+
+### Decisions
+
+#### [DECISION-2.1] OQ-1 resolved — `voyage-3.5`, 1024 dimensions
+- **What:** `embed_model = "voyage-3.5"`, `embedding_dim = 1024`. Verified against Voyage's
+  live model table, not recalled.
+- **Why:** the interesting fact is not which model — it is that **1024 is the default across
+  the entire current Voyage lineup** (`voyage-3.5`, `voyage-3-large`, `voyage-4`,
+  `voyage-4-lite`, `voyage-code-3`, `voyage-finance-2`). So the expensive, irreversible half
+  of this decision — the `vector(N)` baked into two columns — is not actually a bet on
+  `voyage-3.5`. A later model swap is free as long as the replacement stays at 1024.
+- **[CONCEPT] Why a vector column's width is different from every other schema choice:**
+  most column changes are cheap — widening a `VARCHAR` rewrites the column and you carry on.
+  `vector(1024)` is different because the *stored data is only meaningful relative to that
+  number*. An embedding is a point in 1024-dimensional space produced by one specific model;
+  a 512-dimensional model produces points in a different space entirely. They aren't
+  convertible — there's no arithmetic that turns one into the other. So changing N doesn't
+  migrate your data, it **invalidates** it: every row has to be re-embedded from scratch,
+  which means paying for every API call again. It's less like changing a column type and
+  more like changing the units of every measurement in a lab notebook after the samples have
+  been thrown away.
+- **Tradeoff:** locked to 1024. A future 2048-dim model would need a new migration plus a
+  full re-embed.
+- **Alternatives considered:** `voyage-4` (newer, same dimension — a drop-in swap later);
+  keeping the tripwire and asking the human (rejected — the human asked for working code, and
+  the dimension question turned out to have a stable answer).
+
+#### [DECISION-2.2] The `embedding_dim` tripwire stays
+- **What:** `models.py` still raises on `embedding_dim <= 0`, with a reworded message.
+- **Why:** `EMBEDDING_DIM` is env-overridable. A typo in `.env` would otherwise define
+  `vector(0)` columns and fail much later, inside pgvector, with an error that says nothing
+  about where the wrong number came from. The guard was written for OQ-1 but earns its place
+  permanently.
+- **Tradeoff:** none. Codex's test for it keeps passing unchanged.
+
+#### [DECISION-2.3] New table `enrichment_batches` [SPEC_DEVIATION]
+- **What:** a fifth table tracking each submitted Anthropic batch: `batch_id` UNIQUE,
+  `status` in (pending, collected, failed), `request_count`, timestamps.
+- **Why:** `specs/03` requires submit and collect to be two ARQ jobs "with the batch id
+  persisted between them" but never says where. Not in `specs/01-data-model.md`.
+- **[CONCEPT] Why a table and not a variable:** the two halves of enrichment run as separate
+  cron jobs, possibly hours apart, possibly in different worker processes after a restart. A
+  module-level variable holding the batch id dies with the process; a file on disk becomes a
+  second source of truth that can disagree with the database. `worker.py`'s standing rule is
+  that all pipeline state lives in Postgres precisely so that "kill the worker and restart
+  it" is always safe. A batch id is pipeline state.
+- **The bug it also fixes:** `submit_enrichment` skips entirely while any batch is pending.
+  Without that, the `LEFT JOIN` selector — which has no idea a batch is in flight — would
+  re-select the same posts on the next 6h tick and pay for them twice. That is a real
+  double-spend, not a theoretical one: batches are allowed to take up to 24h.
+- **Tradeoff:** a table the human's data-model spec doesn't mention.
+
+#### [DECISION-2.4] `ctx` added to all eight registered job functions — resolves FINDING-1.6
+- **What:** every function in `WorkerSettings.functions` now takes `ctx` first, defaulted to
+  `None` so it stays callable by hand from a REPL.
+- **Why:** ARQ passes its context dict as the first positional argument. Six functions would
+  have raised `TypeError`; `embed_pending` would have silently received the context dict as
+  `batch_size` — the worse failure, because it doesn't raise.
+- **Alternatives considered:** wrapper functions that accept `ctx` and delegate. Rejected —
+  eight wrappers is eight more names for the same eight jobs, and the indirection hides which
+  function the cron actually runs.
+
+#### [DECISION-2.5] Cross-field validator on `Enrichment` — resolves FINDING-1.7
+- **What:** `@model_validator(mode="after")` rejecting `vertical='neither'` with nonzero
+  relevance, mirroring the `ck_signals_neither_zero` CHECK constraint.
+- **Why:** without it the invalid row reaches the INSERT and raises `IntegrityError` — which
+  aborts the transaction that was writing its *siblings*, so one bad model response loses a
+  whole batch's worth of good rows. Failing at validation drops one entry, logs it, and the
+  post is re-selected next tick by the LEFT JOIN.
+- **[CONCEPT] Validating the same rule in two places is not duplication here:** the database
+  constraint is the guarantee — it holds against migrations, repair scripts, and a `psql`
+  prompt. The Pydantic validator is the *boundary*: it decides where a violation is noticed
+  and therefore how much collateral damage it does. Same rule, two jobs.
+
+#### [DECISION-2.6] `[SPEC_DEVIATION]` — `removed` is checked before `too_short`
+- **What:** `specs/03` orders the reject rules with `removed` last; `classify` checks it
+  first.
+- **Why:** a body of literally `[removed]` is 9 characters. Under the spec's order it reports
+  as `too_short` — true, and useless. The reject histogram is the tuning instrument for
+  `MIN_BODY_CHARS`, and deleted content masquerading as short content is exactly the noise
+  that would make you lower a threshold that was correct. Both checks are O(1), so the
+  spec's stated rationale ("cheapest first") doesn't distinguish them.
+
+#### [DECISION-2.7] `[SPEC_DEVIATION]` — `render_header` is a coroutine
+- **What:** scaffolded as sync in cycle 1; now `async`.
+- **Why:** the per-vertical counts are a database aggregate. Computing them in the caller and
+  passing them in just moves the same query one frame up and splits one fact across two
+  functions.
+
+#### [DECISION-2.8] Migration 0002 is written but deliberately unapplied
+- **What:** the hnsw indexes live in their own migration. `alembic upgrade 0001` is the
+  correct head today; `alembic upgrade 0002` is a deliberate later act.
+- **Why:** `specs/04` says to add them once there are a few thousand rows, because an index
+  built on an empty table has useless statistics. Leaving them as a code comment would mean
+  they get forgotten; declaring them on the model would make `--autogenerate` create them
+  immediately, which is the thing being deferred. A written-but-unapplied migration is the
+  only form that survives both failure modes.
+- **[CONCEPT] What an hnsw index is and why timing matters:** finding the nearest vector
+  among thousands by brute force means comparing against every one. hnsw builds a
+  navigable graph so the search hops toward the answer instead — approximate, but orders of
+  magnitude faster. The catch is that the graph's shape is decided *when it's built*, from
+  the data present at that moment. Build it on an empty table and you get a graph optimised
+  for nothing, which Postgres then keeps using.
+
+#### [DECISION-2.9] Migration 0001 hard-codes 1024 rather than reading `settings`
+- **What:** `EMBEDDING_DIM = 1024` as a literal in the migration file.
+- **Why:** a migration is a historical record of what a database was actually changed to. If
+  it read `settings.embedding_dim`, editing `.env` would silently rewrite history — this file
+  would claim to have created `vector(512)` columns on a database that has `vector(1024)`
+  ones, and `downgrade` then `upgrade` would produce a schema that no longer matches the
+  stored embeddings.
+
+#### [DECISION-2.10] `docker-compose.yml` written — unblocks OQ-2/OQ-3
+- **What:** `pgvector/pgvector:pg16` + `redis:7-alpine`, both with healthchecks.
+- **Why:** Builder-owned by the letter of the write-boundary rule, and Codex cannot run a
+  single INV-2 or INV-7 test without it. The image is `pgvector/pgvector`, not stock
+  `postgres` — `CREATE EXTENSION vector` fails on the latter, and the error arrives at
+  migration time rather than at container start.
+- **Note:** no container runtime is installed on this machine, so it is unverified.
+
+#### [DECISION-2.11] Test deps declared — resolves OQ-9/FINDING-1.9
+- **What:** `[project.optional-dependencies] test = ["pytest", "pytest-asyncio"]`.
+- **Why:** Codex named the exact deps and correctly refused to edit a Builder-owned file.
+  The manifest is the only place that makes validation reproducible from a clean checkout.
+
+#### [DECISION-2.12] Plain `import ideas_mining.db.x` in `filter.py` and `score.py`
+- **What:** both modules import the DB layer as `import ideas_mining.db.models as db_models`
+  rather than `from ideas_mining.db.models import ...`.
+- **Why, stated plainly:** Codex's `test_pure_impure_split_is_real_and_db_free` asserts the
+  *module* declares no `from ideas_mining.db …` import, as a proxy for "the pure function is
+  DB-free". The proxy is broader than the property it stands for — `run_filter` and
+  `score_clusters` obviously need a database. The plain-import form satisfies the assertion
+  as written and is ordinary Python, but it does not make the module DB-free and I am not
+  claiming it does. **Codex should narrow that assertion to the pure function's own body**
+  (e.g. walk `classify`'s AST) rather than the whole file. Flagged rather than worked around
+  silently, because a test that passes for the wrong reason is worse than one that fails.
+
+### Work Done
+- `ideas_mining/config.py` — OQ-1 answered; added `DELETED_BODIES`, `POST_TEXT_MAX_CHARS`,
+  `DIGEST_MEMBERS_PER_CLUSTER`, `DIGEST_EXCERPT_CHARS`, `enrich_batch_size`,
+  `embed_batch_size`, `smtp_starttls`, `digest_from_address`, `log_level`.
+- `ideas_mining/db/models.py` — `EnrichmentBatch` added; hnsw TODO replaced by a pointer to
+  migration 0002; tripwire message reworded and kept.
+- `ideas_mining/db/session.py` — engine, session factory, commit/rollback context manager.
+- `ideas_mining/ingest/upsert.py` — batched `ON CONFLICT DO NOTHING … RETURNING id`, plus
+  `dedupe_rows` for intra-batch duplicates.
+- `ideas_mining/ingest/reddit.py` — full ingest; one shared OAuth client across ten
+  subreddits; `_author_name` never returns the string "None"; `_created_at` always tz-aware.
+- `ideas_mining/ingest/hackernews.py` — Algolia pagination, `strip_html` with a deliberately
+  linear tag regex, `vertical_hint` unconditionally NULL.
+- `ideas_mining/filter.py` — `classify` + batched `run_filter`; patterns and keywords
+  compiled/flattened once at import.
+- `ideas_mining/enrich.py` — validator, `build_post_text`, `select_unenriched`,
+  `submit_enrichment`, `collect_enrichment` with all three batch traps handled.
+- `ideas_mining/cluster.py` — `to_pgvector`, `embed_pending` with a dimension assertion
+  before any write, `assign_clusters`, `recluster_all`.
+- `ideas_mining/score.py` — `compute_score`, `CLUSTER_STATS_SQL` (one pass via
+  `FILTER (WHERE …)`), `score_clusters`, `top_clusters`.
+- `ideas_mining/digest.py` — input assembly, SQL-computed header, both sinks, INV-11 order.
+- `ideas_mining/worker.py` — `ctx` everywhere, `redis_settings`, logging configured in
+  `on_startup` not at import.
+- `alembic.ini`, `migrations/env.py`, `migrations/script.py.mako`,
+  `migrations/versions/0001_initial_schema.py`, `migrations/versions/0002_hnsw_indexes.py`.
+- `docker-compose.yml`, `pyproject.toml`, `.env.example`.
+
+### Invariants Verified
+- [x] INV-2 — the vertical is read off the row being assigned and bound into
+      `NEAREST_CENTROID_SQL`. `assign_clusters` contains no branch on a vertical name at all.
+- [x] INV-3 — every write in both ingesters goes through `upsert_raw_posts`.
+- [x] INV-4 — `select_unenriched` is the LEFT JOIN; no state flag was added.
+- [x] INV-6 — `embed_pending` sends `signal.pain_point` and nothing else. No prefix.
+- [x] INV-7 — `count(DISTINCT rp.author)`; `deleted_author` rejected upstream so no NULL
+      collapsing.
+- [x] INV-9 — `top_clusters` is the only ranking path and binds `vertical`.
+- [x] INV-11 — the `digests` row is inserted and the file written before SMTP is attempted;
+      an SMTP exception is logged and swallowed.
+- [x] Config boundary — `os.environ` still appears only in `config.py`; no vertical literal
+      in a conditional outside it. Both re-verified by Codex's greppable tests.
+
+### Security Considerations
+- `PAIN_PATTERNS` and the new `_TAG_RE` in `strip_html` are both linear. `strip_html` uses
+  `<[^>]*>`, not `<(.|\n)*?>` — the latter backtracks catastrophically on a body full of
+  unclosed angle brackets, which is trivially attacker-supplied.
+- Prompt injection blast radius unchanged and bounded: post text enters the user turn only,
+  both system prompts are constants, and enrichment output is schema-validated before it
+  reaches the database. A hostile post can mislabel itself; it cannot emit a new field.
+- SMTP credentials resolve in `settings` and are never logged. The recipient is a configured
+  address, never derived from content. The rendered digest body is not logged at any level.
+- `digests/` is gitignored; the filename is derived from a date, never from content.
+
+### Open Questions
+- `OQ-2`/`OQ-3` are unblocked in principle but **unverified in practice** — no container
+  runtime exists on this machine, so `docker-compose.yml` and both migrations have never run
+  against a real Postgres. The migration SQL renders correctly offline; that is not the same
+  as applying cleanly.
+- `OQ-6` unchanged and still `needs: human`. The manual acceptance criteria (eyeball 20
+  `pain_point` values, read the digest as its recipient) have no assertion form and are the
+  criteria that actually determine whether this system works.
+- `OQ-7` is closed — the repo was already under version control (commit `282b2bb`).
+
+### Handoff
+- Status: READY_FOR_VALIDATION
+- Codex should test:
+  1. **The INV-2 partition test, both halves** (`DECISION-2.1` unblocked this) — two
+     hand-written signals differing only in domain noun, one per vertical, must land in two
+     clusters; then assert the same code with `WHERE vertical` removed **merges** them. The
+     second half is what stops the test passing vacuously.
+  2. **Raw-SQL schema constraints** against a live database, bypassing the ORM: duplicate
+     `(source, external_id)`; duplicate `raw_post_id`; out-of-enum vertical; `relevance = 11`;
+     `neither` with `relevance = 3`; `distinct_authors > member_count`;
+     `enrichment_batches.status` out of enum.
+  3. `alembic upgrade 0001` on an empty DB, then `downgrade base`, then `upgrade head`.
+  4. **Ingest idempotency (`INV-3`)** — `upsert_raw_posts` twice with the same rows returns
+     N then 0. Also `dedupe_rows` on an intra-batch duplicate.
+  5. **`classify`, exhaustively** — one case per reject rule plus the two gate paths. Assert
+     the `removed`-before-`too_short` ordering (`DECISION-2.6`) and that `reason` is never
+     empty on either path.
+  6. **`compute_score` veto behaviour** — `buildable_ratio=0` gives exactly 0; a fresh
+     12-author cluster outranks a two-month-old 3-author one; WTP uses ratios not counts.
+  7. **`strip_html`** — entities, `<p>` becoming a newline, and a pathological unclosed-tag
+     input under a timeout.
+  8. **`collect_enrichment`'s three traps** — out-of-order `custom_id`s map to the right
+     posts; a non-`succeeded` entry writes nothing and doesn't abort its siblings; a
+     truncated body fails `model_validate_json` and is skipped, not coerced.
+  9. **The double-spend guard (`DECISION-2.3`)** — `submit_enrichment` returns None while an
+     `enrichment_batches` row is `pending`.
+  10. `Enrichment.model_json_schema()` emits `additionalProperties: false` and 7 required
+      fields — the API's structured-output mode depends on it.
+- Known edge cases: `assign_clusters` loads all unassigned signals in one transaction —
+  fine at this scale, unbounded in principle. `recluster_all` is deliberately unregistered.
+  `_EPOCH` placeholder timestamps are overwritten inside the same transaction and should
+  never be observable; a 1970 date in a digest means the recompute didn't run.
+- Blockers: none `needs: builder`. `OQ-6` remains `needs: human`. `OQ-2`/`OQ-3` are
+  unblocked but unverified — **nothing in this cycle has touched a real database.**

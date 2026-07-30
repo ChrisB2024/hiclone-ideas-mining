@@ -1,0 +1,47 @@
+# Local Postgres + Redis for development and for the Validator's integration tests.
+#
+# OQ-2: this file is Builder-owned by the write-boundary rule (source reads it at
+# runtime), but its only other consumer is the test suite, which needs a live
+# pgvector database to exercise INV-2 and INV-7 at all. It is written here so the
+# Validator is unblocked; if that ownership call is wrong, the fix is to move it, not
+# to duplicate it.
+#
+# The image is pgvector/pgvector, NOT plain postgres — `CREATE EXTENSION vector` in
+# migration 0001 fails on a stock image, and the error arrives at migration time rather
+# than at container start.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ideas_mining
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Migrations and the worker both fail confusingly against a Postgres that is
+      # accepting TCP but still replaying WAL, so wait for pg_isready rather than
+      # for the port.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ideas_mining"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    # ARQ keeps only job state here, and every pipeline stage is resumable from
+    # Postgres alone — so this is deliberately not persisted. Losing Redis costs at
+    # most one cron tick.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
