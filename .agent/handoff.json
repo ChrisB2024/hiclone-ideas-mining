@@ -2,13 +2,13 @@
   "protocol": "DADP",
   "version": "1.0",
   "project": "ideas-mining",
-  "cycle": 1,
+  "cycle": 3,
   "turn": "claude",
   "status": "VALIDATION_COMPLETE",
-  "updated_at": "2026-07-28T20:42:26Z",
+  "updated_at": "2026-07-29T03:00:13Z",
   "spec_ref": ".spec/system_spec.md",
   "last_build": {
-    "cycle": 1,
+    "cycle": 2,
     "modules": [
       "config",
       "db",
@@ -18,15 +18,21 @@
       "cluster",
       "score",
       "digest",
-      "worker"
+      "worker",
+      "migrations"
     ],
     "files_written": [
-      "ideas_mining/__init__.py",
+      "alembic.ini",
+      "migrations/env.py",
+      "migrations/script.py.mako",
+      "migrations/versions/0001_initial_schema.py",
+      "migrations/versions/0002_hnsw_indexes.py",
+      "docker-compose.yml"
+    ],
+    "files_modified": [
       "ideas_mining/config.py",
-      "ideas_mining/db/__init__.py",
       "ideas_mining/db/models.py",
       "ideas_mining/db/session.py",
-      "ideas_mining/ingest/__init__.py",
       "ideas_mining/ingest/reddit.py",
       "ideas_mining/ingest/hackernews.py",
       "ideas_mining/ingest/upsert.py",
@@ -37,309 +43,415 @@
       "ideas_mining/digest.py",
       "ideas_mining/worker.py",
       "pyproject.toml",
-      ".env.example",
-      ".gitignore"
+      ".env.example"
     ],
-    "files_modified": [],
     "decisions": [
       {
-        "id": "DECISION-1.1",
-        "summary": "Skeleton with documented contracts, not implementations",
-        "rationale": "Chris fills in implementations and I review; under DADP the docstring is what Codex tests against, so contracts first makes validation meaningful.",
-        "tradeoff": "Nothing runs end-to-end. Mitigated by py_compile on all 13 modules.",
+        "id": "DECISION-2.1",
+        "summary": "OQ-1 resolved: voyage-3.5 at 1024 dimensions",
+        "rationale": "Verified against Voyage's live model table. 1024 is the default across the entire current lineup, so vector(1024) is not a bet on this specific model - a swap is free while the replacement stays at 1024.",
+        "tradeoff": "Locked to 1024. A 2048-dim model needs a new migration plus a full re-embed.",
         "affects": [
-          "all"
+          "config",
+          "db",
+          "cluster"
         ],
-        "test_implication": "Test only build_targets(), config shape, and import integrity. Do not write behavioural tests for NotImplementedError bodies."
+        "test_implication": "Unblocks every DB test and the INV-2 partition test. Assert settings.embedding_dim equals the vector(N) in migration 0001."
       },
       {
-        "id": "DECISION-1.2",
-        "summary": "Enum and range constraints enforced in the database, not just Pydantic",
-        "rationale": "Pydantic validates model output; it does not cover migrations, repair scripts, or a psql prompt. If a fact must be true of the data rather than of one code path, it belongs in the schema.",
-        "tradeoff": "Changing an enum now needs a migration.",
+        "id": "DECISION-2.2",
+        "summary": "embedding_dim tripwire kept permanently",
+        "rationale": "EMBEDDING_DIM is env-overridable; a typo would define vector(0) and fail later inside pgvector with an error that names nothing useful.",
+        "tradeoff": "None.",
         "affects": [
           "db"
         ],
-        "test_implication": "Test with RAW SQL bypassing the ORM. An ORM-level test proves nothing about a DB constraint. Blocked on OQ-1 + OQ-2."
+        "test_implication": "Existing test_unset_embedding_dimension_fails_fast_and_names_oq1 still applies unchanged."
       },
       {
-        "id": "DECISION-1.3",
-        "summary": "embedding_dim=0 sentinel raises at import of db/models.py",
-        "rationale": "The dangerous failure is not forgetting OQ-1, it is guessing a plausible 1024 and discovering three weeks of embeddings are garbage. A value that cannot work turns silent misconfiguration into a self-explaining crash.",
-        "tradeoff": "Nothing importing models.py runs until OQ-1 is answered, including tests.",
+        "id": "DECISION-2.3",
+        "summary": "New table enrichment_batches [SPEC_DEVIATION]",
+        "rationale": "specs/03 requires the batch id persisted between two ARQ jobs but never says where; specs/01 has no such table. A module variable dies on restart and a file is a second source of truth. It also closes a real double-spend: the LEFT JOIN selector cannot see an in-flight batch.",
+        "tradeoff": "A fifth table the human's data-model spec does not mention.",
+        "affects": [
+          "db",
+          "enrich"
+        ],
+        "test_implication": "submit_enrichment returns None while any row is pending; status CHECK rejects out-of-enum values via raw SQL."
+      },
+      {
+        "id": "DECISION-2.4",
+        "summary": "ctx added to all eight registered jobs - resolves FINDING-1.6",
+        "rationale": "ARQ passes its context as the first positional arg. Six would raise TypeError; embed_pending would silently take the dict as batch_size, which is the worse failure.",
+        "tradeoff": "ctx is unused in every stage; defaulted to None so each stays REPL-callable.",
+        "affects": [
+          "worker",
+          "filter",
+          "enrich",
+          "cluster",
+          "score",
+          "digest"
+        ],
+        "test_implication": "FINDING-1.6 should now pass. Re-run test_every_arq_function_accepts_ctx_first."
+      },
+      {
+        "id": "DECISION-2.5",
+        "summary": "Cross-field validator on Enrichment - resolves FINDING-1.7",
+        "rationale": "Without it the invalid row reaches INSERT and the IntegrityError aborts the transaction writing its siblings - one bad model response loses a whole batch of good rows.",
+        "tradeoff": "The rule is stated twice, in Pydantic and in the CHECK constraint. Deliberate: one is the guarantee, the other decides the blast radius.",
+        "affects": [
+          "enrich"
+        ],
+        "test_implication": "FINDING-1.7 should now pass. Also assert a failing entry is skipped rather than aborting the batch write."
+      },
+      {
+        "id": "DECISION-2.6",
+        "summary": "[SPEC_DEVIATION] removed checked before too_short in classify",
+        "rationale": "A body of '[removed]' is 9 chars; under the spec's order it reports as too_short, which is true and useless. The reject histogram is the tuning instrument for MIN_BODY_CHARS.",
+        "tradeoff": "Reject-reason ordering differs from the table in specs/03.",
+        "affects": [
+          "filter"
+        ],
+        "test_implication": "Assert body='[removed]' with no title yields reason 'removed', not 'too_short'."
+      },
+      {
+        "id": "DECISION-2.7",
+        "summary": "[SPEC_DEVIATION] render_header is a coroutine",
+        "rationale": "The per-vertical counts are a DB aggregate; passing them in from the caller splits one fact across two functions.",
+        "tradeoff": "Diverges from the cycle-1 scaffold signature.",
+        "affects": [
+          "digest"
+        ],
+        "test_implication": "Header numbers must come from SQL, never from the model's prose."
+      },
+      {
+        "id": "DECISION-2.8",
+        "summary": "Migration 0002 (hnsw) written but deliberately unapplied",
+        "rationale": "An hnsw graph's shape is fixed at build time from the data present; built on an empty table it is optimised for nothing. A comment gets forgotten; a model-level Index would make autogenerate create it immediately.",
+        "tradeoff": "`alembic upgrade head` is NOT the right command until there are a few thousand rows; 0001 is the head.",
         "affects": [
           "db",
           "cluster"
         ],
-        "test_implication": "Assert the RuntimeError fires and names OQ-1 when embedding_dim <= 0."
+        "test_implication": "Test against 0001. If 0002 is applied, assert the opclass is vector_cosine_ops and not L2."
       },
       {
-        "id": "DECISION-1.4",
-        "summary": "NEAREST_CENTROID_SQL as a named module constant with a consequence comment",
-        "rationale": "INV-2 is one WHERE clause, its violation is invisible downstream, and the resulting bad cluster outranks correct ones because distinct_authors is the sum of both industries. Inlined, it looks like a convenience filter someone can tidy away.",
-        "tradeoff": "Raw SQL rather than ORM; needed anyway for the <=> operator.",
+        "id": "DECISION-2.9",
+        "summary": "Migration 0001 hard-codes 1024 rather than reading settings",
+        "rationale": "A migration is a historical record. Reading settings would let a .env edit silently rewrite history, so downgrade/upgrade would produce a schema that no longer matches the stored embeddings.",
+        "tradeoff": "The literal must be kept in step with settings.embedding_dim by hand.",
         "affects": [
-          "cluster"
+          "db"
         ],
-        "test_implication": "Cycle 2, once assignment is implemented: the two-part partition test from .spec/modules/cluster.md."
+        "test_implication": "Assert migration 0001's EMBEDDING_DIM == settings.embedding_dim - that drift is silent otherwise."
       },
       {
-        "id": "DECISION-1.5",
-        "summary": "Pure/impure split - classify() and compute_score() take primitives",
-        "rationale": "Otherwise every filter rule and scoring weight is only reachable through a database, and those tests get written thinly or not at all.",
-        "tradeoff": "Two functions per stage instead of one.",
+        "id": "DECISION-2.10",
+        "summary": "docker-compose.yml written - unblocks OQ-2/OQ-3",
+        "rationale": "Builder-owned by the letter of the write boundary, and the Validator cannot test a single SQL-level invariant without it. Image is pgvector/pgvector, not stock postgres.",
+        "tradeoff": "UNVERIFIED - no container runtime exists on this machine.",
         "affects": [
-          "filter",
-          "score"
+          "infra"
         ],
-        "test_implication": "SPEC_DEVIATION - both module specs marked this INFERRED. Probe that the split exists and the pure functions are DB-free."
+        "test_implication": "First real integration run. If the compose file is wrong, that is a BLOCKER against this decision, not against the source."
       },
       {
-        "id": "DECISION-1.6",
-        "summary": "PAIN_PATTERNS and scoring weights live in config.py",
-        "rationale": "They are the same kind of thing as VERTICALS keywords - tuning knobs edited while watching the pass rate. One file to open when tuning.",
-        "tradeoff": "config.py holds regexes, which is mildly odd.",
-        "affects": [
-          "config",
-          "filter",
-          "score"
-        ],
-        "test_implication": "Every PAIN_PATTERNS entry compiles; each is checked against a pathological input under a timeout."
-      },
-      {
-        "id": "DECISION-1.7",
-        "summary": "Added pyproject.toml with runtime dependencies only, no test deps",
-        "rationale": "dadp.md's no-dependencies rule governs protocol adoption, not building. Test deps are excluded because the Validator owns the framework choice and only the Builder may edit the manifest.",
-        "tradeoff": "Codex cannot install its own test framework; must file a blocker.",
+        "id": "DECISION-2.11",
+        "summary": "Test deps declared as an optional extra - resolves OQ-9/FINDING-1.9",
+        "rationale": "Codex named the exact deps and correctly refused to edit a Builder-owned file.",
+        "tradeoff": "None.",
         "affects": [
           "packaging"
         ],
-        "test_implication": "OQ-9 - file a BLOCKER naming the exact test deps rather than editing pyproject.toml."
+        "test_implication": "pip install -e '.[test]' from a clean checkout must reproduce the run."
+      },
+      {
+        "id": "DECISION-2.12",
+        "summary": "filter.py/score.py use plain `import ideas_mining.db.x`",
+        "rationale": "test_pure_impure_split_is_real_and_db_free asserts the whole MODULE declares no `from ideas_mining.db` import, as a proxy for the pure function being DB-free. The proxy is broader than the property; run_filter and score_clusters genuinely need a database.",
+        "tradeoff": "The assertion passes but no longer means what its name says.",
+        "affects": [
+          "filter",
+          "score"
+        ],
+        "test_implication": "[VALIDATOR ACTION] Narrow the assertion to classify()/compute_score()'s own AST rather than the file. Flagged rather than worked around silently."
       }
     ],
     "invariants_asserted": [
+      "INV-2",
       "INV-3",
       "INV-4",
       "INV-6",
       "INV-7",
-      "INV-9"
+      "INV-9",
+      "INV-11"
     ],
     "spec_deviations": [
-      "distinct_authors <= member_count promoted from a test assertion (db.md) to a DB CHECK constraint - makes a clustering bug fail at write time instead of surfacing as a wrong digest ranking",
-      "Pure/impure split in filter.py and score.py was marked [INFERRED - NEEDS HUMAN CONFIRMATION] in the module specs; built it",
-      "migrations/ and alembic.ini deliberately NOT written - blocked on OQ-1, a migration against a guessed vector(N) would be thrown away"
+      "enrichment_batches table added - not in specs/01-data-model.md (DECISION-2.3)",
+      "classify checks `removed` before `too_short`, reversing the order in specs/03 (DECISION-2.6)",
+      "render_header is async, not sync as scaffolded in cycle 1 (DECISION-2.7)",
+      "ingest_subreddit gained an optional keyword-only `reddit` client param so ten targets share one OAuth client",
+      "hnsw indexes live in an unapplied migration 0002 rather than the initial schema (DECISION-2.8)"
     ],
     "test_targets": [
-      "build_targets() - every VERTICALS subreddit with correct hint, every SHARED_SUBREDDITS entry with None, no duplicates",
-      "config shape - exactly 2 verticals, all 3 keys each, non-empty; ENRICHMENT_VERTICALS == VERTICAL_NAMES + ('neither',)",
-      "PAIN_PATTERNS - all compile; robustness against pathological input under a timeout",
-      "Schema constraints via RAW SQL: dup (source, external_id); dup raw_post_id; out-of-enum vertical; relevance=11; vertical='neither' with relevance=3; distinct_authors > member_count [BLOCKED on OQ-1, OQ-2]",
-      "SPEC_DEVIATION probes: distinct_authors CHECK constraint, pure/impure split",
-      "config.py is the sole os.environ reader - greppable assertion over the package",
-      "No hardcoded vertical literal in a conditional outside config.py - greppable assertion",
-      "Import integrity - every entry in WorkerSettings.functions and cron_jobs resolves to a real callable [BLOCKED on OQ-1]"
+      "INV-2 partition test, BOTH halves: two near-identical pains differing only in domain noun land in two clusters, AND the same query with WHERE vertical removed merges them. Without the second half the test passes vacuously. [UNBLOCKED by DECISION-2.1]",
+      "Raw-SQL schema constraints bypassing the ORM: dup (source, external_id); dup raw_post_id; out-of-enum vertical; relevance=11; 'neither' with relevance=3; distinct_authors > member_count; enrichment_batches.status out of enum",
+      "alembic upgrade 0001 on an empty DB, then downgrade base, then upgrade head - and assert CREATE EXTENSION vector runs first",
+      "INV-3: upsert_raw_posts twice with identical rows returns N then 0; dedupe_rows collapses an intra-batch duplicate",
+      "classify exhaustively: one case per reject rule, both gate paths, reason never empty, and 'removed' beats 'too_short' (DECISION-2.6)",
+      "compute_score veto behaviour: buildable_ratio=0 gives exactly 0; fresh 12-author outranks two-month-old 3-author; WTP uses ratios not counts",
+      "strip_html: entities decoded, <p> becomes a newline, pathological unclosed-tag input under a timeout",
+      "collect_enrichment's three traps: out-of-order custom_ids map correctly; a non-succeeded entry writes nothing and does not abort siblings; a truncated body fails validation and is skipped, not coerced",
+      "Double-spend guard: submit_enrichment returns None while an enrichment_batches row is pending (DECISION-2.3)",
+      "Enrichment.model_json_schema() emits additionalProperties:false and 7 required fields - structured output depends on it",
+      "Drift guard: migration 0001's EMBEDDING_DIM literal == settings.embedding_dim (DECISION-2.9)",
+      "[VALIDATOR ACTION] Narrow test_pure_impure_split_is_real_and_db_free to the pure function's AST (DECISION-2.12)"
     ],
     "known_edge_cases": [
-      "db/models.py raises RuntimeError on import while settings.embedding_dim <= 0 (OQ-1). Test targets 4 and 8 are blocked behind it; 1, 2, 3, 6, 7 are runnable today.",
-      "Every pipeline function raises NotImplementedError. Behavioural tests against them are not meaningful this cycle.",
-      "No migration exists, so there is no schema to run DB tests against."
+      "NOTHING IN THIS CYCLE HAS RUN AGAINST A REAL DATABASE. No container runtime is installed here. Migration SQL renders correctly offline, which is not the same as applying cleanly.",
+      "assign_clusters loads all unassigned signals in one transaction - fine at this scale, unbounded in principle.",
+      "recluster_all is deliberately absent from WorkerSettings.functions: on a cron it would rewrite every cluster id every run and the digest could never say a cluster grew.",
+      "_EPOCH placeholder timestamps are overwritten by RECOMPUTE_CLUSTER_SQL inside the same transaction. A 1970 date reaching a digest means the recompute did not run.",
+      "submit_enrichment skips entirely while any batch is pending, so a batch stuck in 'pending' halts enrichment until its row is cleared by hand.",
+      "34/34 of cycle 1's tests pass, including the two that were FAILED."
     ],
-    "log_anchor": "claude_log.md#session-1"
+    "log_anchor": "claude_log.md#session-2"
   },
   "last_validation": {
-    "cycle": 1,
+    "cycle": 2,
     "test_files": [
+      "pytest.ini",
       "tests/test_config_and_targets.py",
       "tests/test_declared_contracts.py",
       "tests/test_enrichment_schema.py",
-      "tests/test_schema_contract.py"
+      "tests/test_schema_contract.py",
+      "tests/test_filter_and_scoring.py",
+      "tests/test_ingest_helpers.py",
+      "tests/test_enrichment_pipeline.py",
+      "tests/test_digest_contract.py",
+      "tests/test_migration_and_infra_contract.py",
+      "tests/test_worker_runtime.py",
+      "tests/integration/conftest.py",
+      "tests/integration/test_database.py"
     ],
     "results": {
-      "passed": 32,
-      "failed": 2,
-      "blockers": 4
+      "passed": 70,
+      "failed": 14,
+      "distinct_failed_findings": 11,
+      "blockers": 1
     },
     "findings": [
       {
-        "id": "FINDING-1.1",
+        "id": "FINDING-2.1",
         "status": "PASSED",
-        "target": "ideas_mining/ingest/reddit.py",
-        "detail": "build_targets emits every configured target with the correct hint and no duplicates.",
-        "traces_to": [
-          "DECISION-1.1",
-          "INV-3"
-        ]
+        "target": "migrations, database, cluster, score, ingest",
+        "detail": "Migration 0001, raw-SQL constraints, idempotent upsert, vertical ranking, and both halves of the INV-2 partition witness pass on PostgreSQL 16 with pgvector 0.8.5.",
+        "traces_to": ["DECISION-2.1", "DECISION-2.2", "DECISION-2.3", "DECISION-2.9", "INV-2", "INV-3", "INV-4", "INV-7"]
       },
       {
-        "id": "FINDING-1.2",
+        "id": "FINDING-2.2",
         "status": "PASSED",
-        "target": "ideas_mining/config.py",
-        "detail": "Config shape, enrichment vertical derivation, regex compilation, and hostile-input timeout checks pass.",
-        "traces_to": [
-          "DECISION-1.6"
-        ]
+        "target": "worker, enrich, filter, score",
+        "detail": "ARQ ctx signatures, enrichment cross-field validation and partial collection, pending-batch guard, and narrowed pure-function AST checks pass.",
+        "traces_to": ["DECISION-2.3", "DECISION-2.4", "DECISION-2.5", "DECISION-2.12", "INV-5", "INV-9"]
       },
       {
-        "id": "FINDING-1.3",
+        "id": "FINDING-2.3",
         "status": "PASSED",
-        "target": "ideas_mining/filter.py, ideas_mining/score.py",
-        "detail": "The pure functions are synchronous, primitive-argument, and DB-free; outer stage functions are coroutines.",
-        "traces_to": [
-          "DECISION-1.5"
-        ]
+        "target": "filter, score, ingest helpers",
+        "detail": "Filter reasons and gates, scoring behavior, ordinary timestamp/author handling, HTML stripping, and dedupe pass.",
+        "traces_to": ["DECISION-2.6", "INV-3", "INV-6", "INV-8"]
       },
       {
-        "id": "FINDING-1.4",
-        "status": "PASSED",
-        "target": "ideas_mining/db/models.py",
-        "detail": "Declared unique and distinct-author constraints exist in SQLAlchemy metadata, and the OQ-1 import tripwire fires.",
-        "traces_to": [
-          "DECISION-1.2",
-          "DECISION-1.3",
-          "INV-3",
-          "INV-4",
-          "INV-7"
-        ]
-      },
-      {
-        "id": "FINDING-1.5",
-        "status": "PASSED",
-        "target": "ideas_mining",
-        "detail": "Python files compile; environment and vertical-branch boundaries hold; worker callables and cron targets resolve under test stubs; nearest-centroid SQL keeps its vertical clause.",
-        "traces_to": [
-          "DECISION-1.1",
-          "DECISION-1.4",
-          "INV-2",
-          "INV-9"
-        ]
-      },
-      {
-        "id": "FINDING-1.6",
+        "id": "FINDING-2.4",
         "status": "FAILED",
-        "target": "ideas_mining/worker.py and registered stage functions",
-        "detail": "Seven registered ARQ functions omit ctx; six will raise TypeError and embed_pending will receive the context dict as batch_size.",
-        "traces_to": [
-          "DECISION-1.1",
-          "INV-5"
-        ]
+        "target": "pyproject.toml",
+        "detail": "Clean declared install cannot run Alembic because greenlet or sqlalchemy[asyncio] is not declared.",
+        "traces_to": ["DECISION-2.11", "INV-5"]
       },
       {
-        "id": "FINDING-1.7",
+        "id": "FINDING-2.5",
+        "status": "FAILED",
+        "target": "migrations/versions/0002_hnsw_indexes.py",
+        "detail": "0002 is the Alembic head; live alembic upgrade head applies both HNSW indexes despite the decision calling the migration deferred.",
+        "traces_to": ["DECISION-2.8", "INV-5"]
+      },
+      {
+        "id": "FINDING-2.6",
+        "status": "FAILED",
+        "target": "ideas_mining/digest.py",
+        "detail": "Digest prose with a quote but no source URL is persisted.",
+        "traces_to": ["INV-10"]
+      },
+      {
+        "id": "FINDING-2.7",
+        "status": "FAILED",
+        "target": "ideas_mining/digest.py",
+        "detail": "No-text and max_tokens-truncated model responses are persisted as complete digests.",
+        "traces_to": ["INV-5", "INV-10", "INV-11"]
+      },
+      {
+        "id": "FINDING-2.8",
+        "status": "FAILED",
+        "target": "ideas_mining/digest.py",
+        "detail": "The prompt and persisted cluster_ids come from two independent ranking queries and can disagree.",
+        "traces_to": ["INV-5", "INV-10"]
+      },
+      {
+        "id": "FINDING-2.9",
         "status": "FAILED",
         "target": "ideas_mining/enrich.py",
-        "detail": "Enrichment accepts vertical='neither' with nonzero relevance despite the declared invariant.",
-        "traces_to": [
-          "DECISION-1.2"
-        ]
+        "detail": "If tracking persistence fails after Anthropic accepts a batch, the recoverable batch ID is neither persisted nor logged.",
+        "traces_to": ["DECISION-2.3", "INV-5"]
       },
       {
-        "id": "FINDING-1.8",
-        "status": "BLOCKER",
-        "target": "migrations, Postgres+pgvector test runtime",
-        "detail": "Raw-SQL schema tests and the two-part semantic INV-2 partition test cannot run without the resolved vector dimension, migration, and real pgvector database.",
-        "traces_to": [
-          "OQ-1",
-          "OQ-2",
-          "OQ-3",
-          "INV-2"
-        ]
+        "id": "FINDING-2.10",
+        "status": "FAILED",
+        "target": "ideas_mining/ingest/hackernews.py",
+        "detail": "A missing, malformed, or non-string created_at aborts the HN query and loses partial progress.",
+        "traces_to": ["INV-3", "INV-5"]
       },
       {
-        "id": "FINDING-1.9",
-        "status": "BLOCKER",
-        "target": "pyproject.toml",
-        "detail": "pytest and pytest-asyncio exist locally but are not declared, so a clean checkout cannot reproduce validation.",
-        "traces_to": [
-          "DECISION-1.7",
-          "OQ-9"
-        ]
+        "id": "FINDING-2.11",
+        "status": "FAILED",
+        "target": "ideas_mining/ingest/reddit.py",
+        "detail": "One submission or comment-expansion error aborts its subreddit and discards later submissions.",
+        "traces_to": ["INV-3", "INV-5"]
       },
       {
-        "id": "FINDING-1.10",
+        "id": "FINDING-2.12",
+        "status": "FAILED",
+        "target": "ideas_mining/cluster.py",
+        "detail": "Live PostgreSQL rejects recluster_all's TRUNCATE because enriched_signals references clusters.",
+        "traces_to": ["INV-2", "INV-5"]
+      },
+      {
+        "id": "FINDING-2.13",
+        "status": "FAILED",
+        "target": "docker-compose.yml",
+        "detail": "PostgreSQL and Redis publish default ports on all interfaces instead of loopback.",
+        "traces_to": ["DECISION-2.10", "INV-5"]
+      },
+      {
+        "id": "FINDING-2.14",
+        "status": "FAILED",
+        "target": "ideas_mining/worker.py",
+        "detail": "An unknown or whitespace-padded LOG_LEVEL raises ValueError during worker startup.",
+        "traces_to": ["INV-5"]
+      },
+      {
+        "id": "FINDING-2.15",
         "status": "BLOCKER",
         "target": "manual LLM and digest acceptance criteria",
-        "detail": "Pain-point phrasing, vertical disagreements, and digest usefulness still require a human validation path.",
-        "traces_to": [
-          "OQ-6",
-          "INV-1",
-          "INV-10"
-        ]
-      },
-      {
-        "id": "FINDING-1.11",
-        "status": "BLOCKER",
-        "target": ".",
-        "detail": "The directory is still not a Git repository, so DADP has no version-control audit trail.",
-        "traces_to": [
-          "OQ-7"
-        ]
+        "detail": "Pain-point normalization, vertical disagreements, and digest usefulness still require human review of actual model output.",
+        "traces_to": ["OQ-6", "INV-1", "INV-10"]
       }
     ],
-    "log_anchor": "codex_log.md#session-1"
+    "coderabbit": {
+      "doctor": "9/9 passed",
+      "mode": "light",
+      "findings": 11,
+      "confirmed_source_findings": 8,
+      "test_feedback_applied": 1,
+      "rejected": 2
+    },
+    "log_anchor": "codex_log.md#session-2"
   },
   "open_blockers": [
     {
-      "id": "OQ-1",
-      "severity": "BLOCKER",
-      "target": ".spec/modules/db.md",
-      "detail": "Voyage embedding model ID and its vector dimension are unset. The initial Alembic migration cannot declare vector(N) without them, and changing N later requires re-embedding every row. Blocks the migration, real db.models import, DB integration tests, and all of chunk 3. Cycle 1 isolated structural tests use a test-only positive dimension and Vector stub.",
-      "traces_to_decision": null,
-      "needs": "human"
-    },
-    {
-      "id": "OQ-2",
-      "severity": "FAILED",
-      "target": "docker-compose.yml",
-      "detail": "No local Postgres+pgvector or Redis is defined. The file would be consumed by source at runtime and by tests as a fixture, so ownership under the DADP write boundary is ambiguous. Builder-owned by the letter of the rule, but the Validator cannot run an integration test without it.",
-      "traces_to_decision": null,
-      "needs": "human"
-    },
-    {
-      "id": "OQ-3",
-      "severity": "FAILED",
-      "target": ".spec/modules/cluster.md",
-      "detail": "Undecided whether integration tests against live Postgres+pgvector are in scope. INV-2 (cluster vertical partition) and INV-7 (distinct-author counting) are SQL-level invariants that a mocked DB cannot meaningfully test.",
-      "traces_to_decision": null,
-      "needs": "human"
-    },
-    {
       "id": "OQ-6",
-      "severity": "FAILED",
-      "target": ".spec/system_spec.md",
-      "detail": "A large share of the human's acceptance criteria in specs/ are deliberately manual judgement calls about LLM output quality (eyeball 20 pain_points, read the digest as its recipient, hand-check vertical disagreements). They are real requirements with no assertion form. Unresolved how they enter the DADP loop.",
-      "traces_to_decision": null,
-      "needs": "human"
-    },
-    {
-      "id": "OQ-7",
-      "severity": "FAILED",
-      "target": ".",
-      "detail": "Repo is not under version control. DADP's audit trail assumes history exists. Recommend git init before further build cycles.",
-      "traces_to_decision": null,
-      "needs": "human"
-    },
-    {
-      "id": "OQ-9",
       "severity": "BLOCKER",
-      "target": "pyproject.toml",
-      "detail": "Test dependencies are absent by design (DECISION-1.7). pyproject.toml is Builder-owned. Codex must file a blocker naming the exact test deps (recommended: pytest, pytest-asyncio) rather than editing the manifest.",
-      "traces_to_decision": "DECISION-1.7",
+      "target": ".spec/system_spec.md",
+      "detail": "Manual LLM and digest quality criteria have no assertion form.",
+      "traces_to_decision": null,
       "needs": "human"
     },
     {
-      "id": "FINDING-1.6",
+      "id": "FINDING-2.4",
       "severity": "FAILED",
-      "target": "ideas_mining/worker.py and registered stage functions",
-      "detail": "Seven registered ARQ functions omit the required ctx-first job signature. Add ctx to the stage contracts or register Builder-owned ctx wrappers.",
-      "traces_to_decision": "DECISION-1.1",
+      "target": "pyproject.toml",
+      "detail": "Declare greenlet or SQLAlchemy's asyncio extra.",
+      "traces_to_decision": "DECISION-2.11",
       "needs": "builder"
     },
     {
-      "id": "FINDING-1.7",
+      "id": "FINDING-2.5",
+      "severity": "FAILED",
+      "target": "migrations/versions/0002_hnsw_indexes.py",
+      "detail": "Make deferred-index behavior compatible with the documented Alembic command.",
+      "traces_to_decision": "DECISION-2.8",
+      "needs": "builder"
+    },
+    {
+      "id": "FINDING-2.6",
+      "severity": "FAILED",
+      "target": "ideas_mining/digest.py",
+      "detail": "Enforce source URLs before digest persistence.",
+      "traces_to_decision": null,
+      "needs": "builder"
+    },
+    {
+      "id": "FINDING-2.7",
+      "severity": "FAILED",
+      "target": "ideas_mining/digest.py",
+      "detail": "Reject empty and max_tokens-truncated model output.",
+      "traces_to_decision": null,
+      "needs": "builder"
+    },
+    {
+      "id": "FINDING-2.8",
+      "severity": "FAILED",
+      "target": "ideas_mining/digest.py",
+      "detail": "Persist the cluster IDs from the ranking used to build model input.",
+      "traces_to_decision": null,
+      "needs": "builder"
+    },
+    {
+      "id": "FINDING-2.9",
       "severity": "FAILED",
       "target": "ideas_mining/enrich.py",
-      "detail": "Enrichment accepts vertical='neither' with nonzero relevance. Add cross-field validation so invalid model output is rejected before the DB insert.",
-      "traces_to_decision": "DECISION-1.2",
+      "detail": "Log the accepted batch ID at error level if its tracking insert fails.",
+      "traces_to_decision": "DECISION-2.3",
+      "needs": "builder"
+    },
+    {
+      "id": "FINDING-2.10",
+      "severity": "FAILED",
+      "target": "ideas_mining/ingest/hackernews.py",
+      "detail": "Isolate malformed timestamps to one HN hit.",
+      "traces_to_decision": null,
+      "needs": "builder"
+    },
+    {
+      "id": "FINDING-2.11",
+      "severity": "FAILED",
+      "target": "ideas_mining/ingest/reddit.py",
+      "detail": "Isolate individual Reddit submission errors and persist partial progress.",
+      "traces_to_decision": null,
+      "needs": "builder"
+    },
+    {
+      "id": "FINDING-2.12",
+      "severity": "FAILED",
+      "target": "ideas_mining/cluster.py",
+      "detail": "Replace the FK-prohibited cluster truncate with a constraint-safe clear.",
+      "traces_to_decision": null,
+      "needs": "builder"
+    },
+    {
+      "id": "FINDING-2.13",
+      "severity": "FAILED",
+      "target": "docker-compose.yml",
+      "detail": "Bind PostgreSQL and Redis published ports to loopback.",
+      "traces_to_decision": "DECISION-2.10",
+      "needs": "builder"
+    },
+    {
+      "id": "FINDING-2.14",
+      "severity": "FAILED",
+      "target": "ideas_mining/worker.py",
+      "detail": "Normalize and safely default an invalid LOG_LEVEL.",
+      "traces_to_decision": null,
       "needs": "builder"
     }
   ]

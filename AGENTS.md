@@ -52,6 +52,21 @@ edges. In this repo that specifically means: untrusted forum text, prompt-inject
 post bodies, deleted authors, naive datetimes, out-of-order batch results, unreachable SMTP,
 a dead subreddit mid-gather.
 
+## 4a. CodeRabbit review — required
+
+Run CodeRabbit during every validation cycle after reading the Builder's changes and before
+closing the handoff. Review both:
+
+- Builder-owned production code for security risks, production failures, unsafe defaults,
+  concurrency/resumability gaps, and deployment problems.
+- Validator-owned tests for false confidence, weak assertions, missing hostile cases, and
+  tests that pass for the wrong reason.
+
+Treat CodeRabbit findings as leads, not verdicts: reproduce or verify each material finding
+against the spec and code before recording it. Trace confirmed findings to a decision or
+invariant using the normal `[PASSED]` / `[FAILED]` / `[BLOCKER]` format. Never fix
+Builder-owned source.
+
 ## 5. Finding format
 
 Every finding tagged `[PASSED]` / `[FAILED]` / `[BLOCKER]` and traced back to the decision ID

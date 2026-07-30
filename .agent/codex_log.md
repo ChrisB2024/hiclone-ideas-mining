@@ -196,3 +196,183 @@ Validating: declared skeleton contracts only. No behavioral tests were written f
 - Status: `VALIDATION_COMPLETE`.
 - Builder should address `FINDING-1.6` and `FINDING-1.7`, then flip the turn back to Codex.
 - Human decisions remain required for `OQ-1`, `OQ-2`, `OQ-3`, `OQ-6`, `OQ-7`, and `OQ-9`.
+
+---
+
+## Session 2 — 2026-07-28 — IMPLEMENTATION VALIDATION
+
+### Context
+Reading from: `.agent/handoff.json` (`last_build.cycle = 2`, `turn: codex`),
+`.agent/claude_log.md#session-2`, every file named by `last_build`, the system spec, and all
+8 module specs. Validation ran against Python 3.13, PostgreSQL 16.13, and pgvector 0.8.5.
+No Builder-owned source was modified.
+
+### Test coverage added
+
+- `tests/test_filter_and_scoring.py`
+- `tests/test_ingest_helpers.py`
+- `tests/test_enrichment_pipeline.py`
+- `tests/test_digest_contract.py`
+- `tests/test_migration_and_infra_contract.py`
+- `tests/test_worker_runtime.py`
+- `tests/integration/conftest.py`
+- `tests/integration/test_database.py`
+- `pytest.ini`
+- Narrowed the cycle-1 pure-function AST assertion in
+  `tests/test_declared_contracts.py` per `DECISION-2.12`.
+
+The clean declared install initially failed before Alembic could connect because
+`greenlet` was not installed. It was added to the ignored local `.venv` only so the
+remaining migration and integration tests could run; the manifest was not changed.
+
+Commands and results:
+
+- Baseline after `pip install -e '.[test]'`: **34 passed**.
+- Unit/focused: `.venv/bin/python -m pytest -q -m 'not integration'`:
+  **59 passed, 13 failed, 12 deselected**.
+- Live integration: `pytest -q -m integration`:
+  **11 passed, 1 failed, 72 deselected**.
+- Final combined suite against live PostgreSQL: **70 passed, 14 failed**.
+  The 14 failing cases represent 11 distinct production defects; the malformed HN
+  timestamp defect has three parameterized cases and empty/truncated digest output has
+  two.
+
+### Live migration and database validation
+
+No container runtime exists on this host, so the compose services could not be started.
+Instead, the official pgvector 0.8.5 source was built against the installed PostgreSQL 16
+and a temporary local cluster was created on port 55439.
+
+1. `alembic upgrade 0001` succeeded after the validator-only `greenlet` install.
+2. The vector extension and all five tables were verified.
+3. Raw-SQL uniqueness, range, enum, and author-count constraints passed.
+4. `INV-2` passed both halves: vertical-partitioned assignment created two clusters, while
+   the controlled unpartitioned query selected the cross-vertical identical vector.
+5. `alembic downgrade base` removed the application schema.
+6. `alembic upgrade head` applied both 0001 and 0002 and created both cosine HNSW indexes,
+   disproving the claim that 0002 is “deliberately unapplied”.
+
+### CodeRabbit review
+
+`coderabbit doctor` passed all 9 checks and confirmed authentication. The full review
+stalled without completing and was interrupted; the light review completed over all
+Builder and Validator changes with 11 findings.
+
+Confirmed and regression-tested:
+
+- Public compose port bindings (`FINDING-2.13`).
+- Malformed HN timestamps abort a query (`FINDING-2.10`).
+- Digest prose and persisted cluster IDs can come from different rankings
+  (`FINDING-2.8`).
+- Empty or token-truncated digest output is persisted (`FINDING-2.7`).
+- An accepted Anthropic batch can become untracked without logging its recoverable ID
+  (`FINDING-2.9`).
+- `recluster_all()` uses an FK-prohibited truncate (`FINDING-2.12`).
+- One Reddit submission/comment failure discards later submissions
+  (`FINDING-2.11`).
+- Invalid `LOG_LEVEL` can crash worker startup (`FINDING-2.14`).
+
+Accepted Validator-test feedback: the out-of-order enrichment fixture now contains two
+successful shuffled IDs, so position-keyed parsing cannot pass accidentally.
+
+Rejected:
+
+- Moving `IDEAS_MINING_TEST_DATABASE_URL` from integration `conftest.py` into production
+  config would violate the test-only write boundary and make a test control part of runtime
+  configuration.
+- Closing `.agent/handoff.json` during the review was premature; it is closed only after
+  all findings and final counts are recorded.
+
+### Findings
+
+#### [FINDING-2.1] [PASSED] — live schema and partition invariants hold
+- Migration 0001 applies to an empty PostgreSQL+pgvector database. Raw-SQL constraints,
+  idempotent upsert, vertical-only ranking, distinct-author bounds, and both halves of the
+  `INV-2` partition witness pass.
+- Traces to: `DECISION-2.1`, `DECISION-2.2`, `DECISION-2.3`, `DECISION-2.9`,
+  `INV-2`, `INV-3`, `INV-4`, `INV-7`.
+
+#### [FINDING-2.2] [PASSED] — cycle-1 failures and declared stage contracts are fixed
+- All registered ARQ jobs accept `ctx`; `Enrichment` rejects `neither` with nonzero
+  relevance; partial/out-of-order batch collection is isolated; pending batches block a
+  second submit; the narrowed pure-function AST checks pass.
+- Traces to: `DECISION-2.3`, `DECISION-2.4`, `DECISION-2.5`,
+  `DECISION-2.12`, `INV-5`, `INV-9`.
+
+#### [FINDING-2.3] [PASSED] — filter, score, and ordinary ingest behavior holds
+- Exhaustive filter reasons, both gate paths, removed-before-too-short deviation, score
+  veto/freshness/WTP behavior, HTML stripping, deleted Reddit authors, timezone-aware
+  timestamps, and intra-batch dedupe pass.
+- Traces to: `DECISION-2.6`, `INV-3`, `INV-6`, `INV-8`.
+
+#### [FINDING-2.4] [FAILED] — async SQLAlchemy runtime dependency is absent
+- A clean `pip install -e '.[test]'` cannot run Alembic: SQLAlchemy raises
+  `ValueError: the greenlet library is required`. Neither `greenlet` nor
+  `sqlalchemy[asyncio]` is declared.
+- Traces to: `DECISION-2.11`, `INV-5`.
+
+#### [FINDING-2.5] [FAILED] — “deferred” HNSW migration is the Alembic head
+- `ScriptDirectory.get_current_head()` returns 0002, not 0001. A live
+  `alembic upgrade head` applied 0002 and created both indexes. The operational command
+  documented by the decision cannot keep 0002 unapplied.
+- Traces to: `DECISION-2.8`, `INV-5`.
+
+#### [FINDING-2.6] [FAILED] — digest source URLs are not enforced
+- `send_digest()` persists model prose containing a quote with no URL, despite `INV-10`.
+- Traces to: `INV-10`.
+
+#### [FINDING-2.7] [FAILED] — empty and truncated digest responses are persisted
+- A response with no text blocks becomes a header-only digest. A response ending with
+  `stop_reason="max_tokens"` is also persisted as complete.
+- Traces to: `INV-5`, `INV-10`, `INV-11`.
+
+#### [FINDING-2.8] [FAILED] — persisted cluster IDs can disagree with digest prose
+- `gather_digest_input()` ranks clusters for the model, then `send_digest()` independently
+  ranks them again for persistence. A ranking change between calls stores IDs that did not
+  produce the digest.
+- Traces to: `INV-5`, `INV-10`.
+
+#### [FINDING-2.9] [FAILED] — an accepted enrichment batch can become untracked
+- If Anthropic accepts a batch and the following `enrichment_batches` insert fails, the
+  batch ID is neither persisted nor logged. Recovery is impossible and the next tick can
+  resubmit the same posts.
+- Traces to: `DECISION-2.3`, `INV-5`.
+
+#### [FINDING-2.10] [FAILED] — one malformed HN timestamp aborts a query
+- Missing, non-ISO, and non-string `created_at` values escape `_hit_to_row`. The exception
+  prevents the already-collected page rows from reaching the final upsert.
+- Traces to: `INV-3`, `INV-5`.
+
+#### [FINDING-2.11] [FAILED] — one Reddit submission failure loses later posts
+- Comment expansion errors are only isolated at the subreddit level. A bad first
+  submission aborts iteration and prevents later valid submissions and accumulated rows
+  from being persisted.
+- Traces to: `INV-3`, `INV-5`.
+
+#### [FINDING-2.12] [FAILED] — `recluster_all()` cannot clear clusters
+- Live PostgreSQL rejects `TRUNCATE clusters RESTART IDENTITY` because
+  `enriched_signals.cluster_id` has a foreign-key constraint. Nulling values first does not
+  remove the table-level dependency.
+- Traces to: `INV-2`, `INV-5`.
+
+#### [FINDING-2.13] [FAILED] — compose exposes stateful services on all interfaces
+- PostgreSQL and Redis publish default ports without a loopback host binding; PostgreSQL
+  also uses public development credentials. On a shared/LAN-connected workstation this
+  exposes both services beyond the intended local validation runtime.
+- Traces to: `DECISION-2.10`, `INV-5`.
+
+#### [FINDING-2.14] [FAILED] — malformed log level crashes worker startup
+- Whitespace or an unknown `LOG_LEVEL` reaches `logging.basicConfig` as an invalid string
+  and raises `ValueError` before the worker starts.
+- Traces to: `INV-5`.
+
+#### [FINDING-2.15] [BLOCKER] — manual quality acceptance still needs a human path
+- No proxy assertions were invented for pain-point normalization, vertical disagreements,
+  or digest usefulness. Those acceptance criteria require reading actual model output.
+- Traces to: `OQ-6`, `INV-1`, `INV-10`.
+
+### Handoff
+- Status: `VALIDATION_COMPLETE`; turn returned to Claude.
+- Builder should fix `FINDING-2.4` through `FINDING-2.14` and rerun the added regressions.
+- `OQ-2` and `OQ-3` are now verified with a real PostgreSQL+pgvector runtime.
+- `OQ-6` remains human-owned.

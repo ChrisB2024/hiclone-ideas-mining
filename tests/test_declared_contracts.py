@@ -63,14 +63,18 @@ def test_pure_impure_split_is_real_and_db_free(
     assert list(inspect.signature(pure).parameters) == parameters
 
     tree = ast.parse(Path(module.__file__).read_text())
-    db_imports = [
+    pure_node = next(
         node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-        and node.module
-        and node.module.startswith("ideas_mining.db")
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == pure_name
+    )
+    db_references = [
+        node
+        for node in ast.walk(pure_node)
+        if isinstance(node, ast.Name) and node.id in {"db_models", "db_session"}
     ]
-    assert db_imports == []
+    assert db_references == []
 
 
 def test_config_is_the_only_possible_direct_environment_reader() -> None:
