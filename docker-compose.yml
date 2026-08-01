@@ -14,14 +14,22 @@ services:
   postgres:
     image: pgvector/pgvector:pg16
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: ideas_mining
+      # Overridable from .env, which compose reads automatically (second half of
+      # FINDING-2.13 — the finding named the credentials as well as the ports). The
+      # defaults stay weak on purpose: this is a throwaway local database, and a
+      # plausible-looking password in a committed file is worse than an obviously
+      # disposable one, because it invites reuse somewhere that matters.
+      #
+      # If you override these, DATABASE_URL in .env has to match — nothing checks it.
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-ideas_mining}
     ports:
       # Bound to loopback (FINDING-2.13). A bare "5432:5432" publishes on every
       # interface, so on a cafe or office network this database — which holds scraped
       # post bodies and author names — is reachable by anyone on the LAN, behind a
-      # password of "postgres".
+      # password of "postgres". The loopback bind is what actually contains that; the
+      # credentials above are defence in depth, not the fix.
       - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
