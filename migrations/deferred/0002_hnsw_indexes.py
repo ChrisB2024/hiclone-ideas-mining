@@ -38,12 +38,69 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0002"
 down_revision: str | None = "0001"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
+
+
+#: An index is only reusable if it is valid, is an hnsw index, and uses the cosine
+#: operator class. Anything else wearing the name must go.
+_INDEX_STATE_SQL = sa.text(
+    """
+    SELECT idx.indisvalid AS is_valid,
+           am.amname      AS access_method,
+           opc.opcname    AS operator_class
+    FROM pg_index idx
+    JOIN pg_class cls ON cls.oid = idx.indexrelid
+    JOIN pg_am am ON am.oid = cls.relam
+    JOIN pg_opclass opc ON opc.oid = idx.indclass[0]
+    WHERE cls.relname = :name
+    """
+)
+
+
+def _drop_unusable_index(name: str) -> None:
+    """Drop an existing index of this name unless it is exactly what we want.
+
+    Inputs:
+        name: the index name this migration owns.
+
+    FINDING-4.5. ``CREATE INDEX CONCURRENTLY IF NOT EXISTS`` matches on the name alone,
+    so it silently accepts:
+
+    * an **invalid** index left behind by a concurrent build that failed partway — it
+      is never used to answer queries but still costs on every write; and
+    * an index on the **wrong operator class**. Voyage vectors are normalized for
+      cosine, and an L2 index does not error — it quietly returns worse neighbours.
+      That is the failure mode this whole module exists to avoid, and it would have
+      been recorded as revision 0002, i.e. as done.
+
+    Either way Alembic stamps the revision and the system believes it has an index it
+    does not have. Reconciling is safe because these two names are owned by this
+    migration; nothing else in the schema creates them.
+    """
+    existing = op.get_bind().execute(_INDEX_STATE_SQL, {"name": name}).mappings().first()
+    if existing is None:
+        return
+
+    usable = (
+        existing["is_valid"]
+        and existing["access_method"] == "hnsw"
+        and existing["operator_class"] == "vector_cosine_ops"
+    )
+    if usable:
+        return
+
+    print(
+        f"  reconciling {name}: found "
+        f"{existing['access_method']}/{existing['operator_class']} "
+        f"valid={existing['is_valid']} — dropping and rebuilding"
+    )
+    op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {name}")
 
 
 def upgrade() -> None:
@@ -62,17 +119,32 @@ def upgrade() -> None:
     transaction. If the second index fails, the first is already committed. Both use
     ``IF NOT EXISTS`` so a re-run is safe.
 
-    One caveat worth knowing before you run this on real data: a ``CONCURRENTLY`` build
-    that fails partway leaves an **invalid** index behind. It is not used for queries
-    but it does slow writes, and ``IF NOT EXISTS`` will consider it present. Check with
-    ``SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid`` and drop any
-    invalid leftovers before re-running.
+    ``IF NOT EXISTS`` matches on the index **name only**, so any leftover index wearing
+    the right name is accepted — including an invalid one from a failed concurrent
+    build, or one built on the wrong operator class. ``_drop_unusable_index`` below
+    removes those first (FINDING-4.5).
     """
-    with op.get_context().autocommit_block():
+    if op.get_context().as_sql:
+        # Offline (`--sql`) mode has no connection to inspect, so emit the plain
+        # statements. Reconciling an existing index is inherently an online operation.
         op.execute(
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_signals_embedding_hnsw "
             "ON enriched_signals USING hnsw (embedding vector_cosine_ops)"
         )
+        op.execute(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_clusters_centroid_hnsw "
+            "ON clusters USING hnsw (centroid vector_cosine_ops)"
+        )
+        return
+
+    with op.get_context().autocommit_block():
+        _drop_unusable_index("ix_signals_embedding_hnsw")
+        op.execute(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_signals_embedding_hnsw "
+            "ON enriched_signals USING hnsw (embedding vector_cosine_ops)"
+        )
+
+        _drop_unusable_index("ix_clusters_centroid_hnsw")
         op.execute(
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_clusters_centroid_hnsw "
             "ON clusters USING hnsw (centroid vector_cosine_ops)"

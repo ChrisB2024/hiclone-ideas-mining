@@ -911,3 +911,142 @@ connection built from `settings`; no credential is logged.
   5. Concurrent index construction against a table under concurrent writes, if that's
      cheap to arrange; otherwise assert the autocommit block and `IF NOT EXISTS` textually.
 - Blockers: none `needs: builder`. `OQ-6` remains `needs: human`.
+
+---
+
+## Session 5 — 2026-08-01 — FIX CYCLE-4 VALIDATION FINDINGS
+
+### Context
+Reading from: `handoff.json` (turn=claude, cycle 5, VALIDATION_COMPLETE), Codex session 4
+in full. Addressing `FINDING-4.4`, `FINDING-4.5`, `FINDING-4.6` — all `needs: builder`.
+
+Codex's three passes this cycle are worth naming, because they retired real doubt: a live
+`CREATE INDEX CONCURRENTLY` was proven not to block a concurrent pipeline write
+(`FINDING-4.2`), the unknown-revision boundary still fails loudly (`FINDING-4.1`), and the
+documented blockquote shapes behave (`FINDING-4.3`).
+
+All three failures share one shape: **my cycle-4 fixes were correct for the case I tested
+and wrong at the edge just outside it.** That is worth recording as a pattern, not three
+separate mistakes.
+
+### Decisions
+
+#### [DECISION-5.1] Quote detection covers plain-text quotes — FINDING-4.4
+- **What:** `_quote_units()` returns blockquote blocks *plus* any line carrying a
+  quotation-marked span that isn't already inside one. Every unit needs its own URL.
+  `_quote_blocks()` keeps its blockquote-only meaning.
+- **Why:** cycle 4 enforced links per `>` block. The prompt asks for markdown and for "the
+  strongest verbatim quote with its link" — it never asks for blockquote syntax, and the
+  model frequently writes `Strongest quote: "…" https://…`. With no blockquotes in the
+  document, the per-quote rule found nothing to check and fell straight through to the
+  aggregate test that FINDING-3.5 was raised about. The bug I fixed in cycle 4 was still
+  live for the *likelier* output shape.
+- **[CONCEPT] Validating a format the producer never promised.** The real lesson: I wrote a
+  checker against the output I'd imagined, then confirmed it against examples I'd also
+  imagined. Nothing anywhere requires the model to use `>`. When you validate someone
+  else's output, the rule has to key on the thing that's actually guaranteed — here, "a
+  quote" — not on the formatting you happen to have seen.
+
+#### [DECISION-5.2] Two more holes found by my own probing, not by the suite
+- **What:** while checking DECISION-5.1 by hand, two cases failed that no test covers:
+  1. `Strongest quote: "A" https://…` produced **zero** quote units — my span regex
+     required 2+ characters inside the quotes, so short quotes were invisible. Relaxed to
+     one or more.
+  2. **A linked blockquote laundered the unlinked quote after it.** The
+     trailing-attribution rule absorbs the next non-blank line into the block, so
+     `> "Q1" https://…` followed by `Strongest quote: "Q2 has no link"` swallowed Q2 into a
+     block that already had a URL — and the digest was accepted. Exactly FINDING-4.4 one
+     layer down. The trailing line is now only absorbed if it isn't itself a quote.
+- **Why record this:** case 2 is a genuine INV-10 violation that survived a validation
+  cycle. Codex's tests, my fix, and Codex's new tests all missed it, and it only appeared
+  because I ran the mixed shape by hand rather than trusting a green suite.
+
+#### [DECISION-5.3] The opt-in migration reconciles a wrong or invalid index — FINDING-4.5
+- **What:** before each `CREATE INDEX CONCURRENTLY IF NOT EXISTS`, check `pg_index` for an
+  index of that name. If it isn't valid, hnsw, and `vector_cosine_ops`, drop it
+  concurrently and rebuild. Offline (`--sql`) mode emits the plain statements, since
+  reconciling requires a connection.
+- **Why:** `IF NOT EXISTS` matches on the **name only**. A leftover invalid index from a
+  failed concurrent build, or one built on the wrong operator class, is accepted — and
+  Alembic then records revision 0002. The system believes it has a cosine index and does
+  not. `specs/04` warns that the wrong opclass "silently gives you worse neighbors rather
+  than an error"; this made that silent failure *reachable through the documented
+  procedure*, and stamped as done.
+- **[CONCEPT] `IF NOT EXISTS` checks identity, not equivalence.** It answers "is there
+  something with this name", never "is there something that does this job". Any idempotency
+  built on it inherits that gap, which is why the reconcile has to inspect the catalogue.
+- **Safe because** these two index names are owned by this migration; nothing else creates
+  them.
+
+#### [DECISION-5.4] The opt-in tolerance applies to upgrades only — FINDING-4.6
+- **What:** the early return added in DECISION-4.1 is now gated on the running command
+  being `upgrade`. Everything else — `downgrade`, `stamp`, `history` — proceeds and hits
+  Alembic's own error.
+- **Why:** DECISION-4.1 made *every* command a no-op on an opt-in database. `alembic
+  downgrade base` exited 0, printed nothing, and left all five tables and revision 0002 in
+  place. A command that reports success for work it did not do is worse than the error it
+  was suppressing: the error is survivable, the false success is what you act on.
+- **Implementation note that cost the most time here:** `alembic.context` is a module of
+  proxy *functions*, not the EnvironmentContext instance, so `context.context_opts` does
+  not exist there and my first attempt silently read `{}` — disabling the tolerance
+  entirely rather than scoping it. The command is only knowable after
+  `context.configure()`, which copies those options onto the MigrationContext, so the test
+  moved into `_do_run`. This is the second time in two cycles that a wrong assumption about
+  *when* Alembic state becomes available produced a silent no-op rather than an error.
+
+### Work Done
+- `ideas_mining/digest.py` — `_blockquote_spans` (returns consumed line indices),
+  `_quote_units`, relaxed `_QUOTED_SPAN_RE`, non-absorbing trailing rule.
+- `migrations/deferred/0002_hnsw_indexes.py` — `_INDEX_STATE_SQL`,
+  `_drop_unusable_index`, offline-mode branch.
+- `migrations/env.py` — `_is_upgrade()` moved after `configure()`, skip decision applied
+  inside `_do_run`.
+
+### Invariants Verified
+- [x] INV-10 — enforced per quote regardless of the markdown shape the model chose.
+- [x] INV-5 — `downgrade` and `stamp` can no longer report false success; the wrong-index
+      path can no longer record 0002 against an index that doesn't do the job.
+
+### Live verification (port 55440, PostgreSQL 16.13 + pgvector 0.8.5)
+Full suite: **112 passed, 0 failed, 0 skipped.**
+
+Checked by hand against the database:
+
+| check | result |
+|---|---|
+| plant `vector_l2_ops` index, then opt in | reconciled → `vector_cosine_ops`, valid, version 0002 |
+| default `downgrade base` after opt-in | rc 255, schema intact, version unchanged |
+| default `upgrade head` after opt-in | rc 0, still tolerant |
+
+Quote shapes checked by hand, all as intended: plain-text with one link for two quotes
+(reject), plain-text both linked (accept), blockquote + attribution line (accept),
+multiline blockquote with trailing link (accept), no quotes but a link (accept), **mixed
+linked-blockquote followed by unlinked plain-text quote (reject)**, smart-quote unlinked
+(reject).
+
+### Security Considerations
+`_drop_unusable_index` issues DDL derived from a hardcoded name constant, never from
+user or model input. No change to the trust boundaries.
+
+### Open Questions
+- `OQ-6` unchanged, `needs: human`, still the only non-Builder item.
+
+### Handoff
+- Status: READY_FOR_VALIDATION
+- Codex should test:
+  1. **The laundering case from DECISION-5.2**: a linked blockquote immediately followed by
+     an unlinked plain-text quote must be rejected. This one passed every existing test
+     while violating INV-10 — it is the highest-value regression in this cycle.
+  2. Single-character quoted spans (`"A"`) are detected as quotes at all.
+  3. Smart quotes (`“…”`) are treated as quotes.
+  4. A quote whose URL is a bare markdown link `[text](https://…)` — I have not verified
+     that shape and `_URL_RE` should match inside it, but it is unasserted.
+  5. `alembic stamp` and `alembic history` on an opt-in database: neither should report
+     false success (DECISION-5.4 is scoped to `upgrade`, so these should hit Alembic's
+     error — assert that, since only `downgrade` was reproduced).
+  6. The reconcile path for an **invalid** index specifically (Codex reproduced the
+     wrong-opclass half; the invalid half shares the mechanism but is untested). Build one
+     by cancelling a concurrent build, or by `UPDATE pg_index SET indisvalid = false`.
+  7. Offline `alembic -c alembic.deferred.ini upgrade head --sql` still emits both
+     statements and does not attempt to inspect a connection.
+- Blockers: none `needs: builder`. `OQ-6` remains `needs: human`.

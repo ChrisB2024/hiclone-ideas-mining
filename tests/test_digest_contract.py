@@ -196,6 +196,58 @@ def test_validate_model_output_requires_a_link_for_each_markdown_quote() -> None
         digest_module.validate_model_output(prose, "end_turn")
 
 
+@pytest.mark.parametrize(
+    ("prose", "expected"),
+    [
+        (
+            '> "First line\n> second line" https://example.com/multiline',
+            ['> "First line\n> second line" https://example.com/multiline'],
+        ),
+        (
+            '> "Quoted pain"\n\n— source https://example.com/attribution',
+            ['> "Quoted pain"\n— source https://example.com/attribution'],
+        ),
+        (
+            '>> "Nested quote" https://example.com/nested',
+            ['>> "Nested quote" https://example.com/nested'],
+        ),
+        ("Plain prose https://example.com/source", []),
+    ],
+)
+def test_quote_blocks_supports_documented_markdown_shapes(
+    prose: str,
+    expected: list[str],
+) -> None:
+    assert digest_module._quote_blocks(prose) == expected
+    digest_module.validate_model_output(prose, "end_turn")
+
+
+def test_validate_model_output_rejects_one_unlinked_quote_among_ten() -> None:
+    prose = "\n\n".join(
+        (
+            f'> "Quote {number}" https://example.com/{number}'
+            if number != 7
+            else '> "Quote 7 is missing its link"'
+        )
+        for number in range(1, 11)
+    )
+
+    with pytest.raises(ValueError, match="Quote 7 is missing its link"):
+        digest_module.validate_model_output(prose, "end_turn")
+
+
+def test_validate_model_output_enforces_links_when_quotes_are_not_blockquotes() -> None:
+    prose = (
+        "## INSURANCE\n"
+        'Strongest quote: "Linked pain" https://example.com/linked\n\n'
+        "## REAL ESTATE\n"
+        'Strongest quote: "Unlinked pain"'
+    )
+
+    with pytest.raises(ValueError, match="source URL"):
+        digest_module.validate_model_output(prose, "end_turn")
+
+
 @pytest.mark.asyncio
 async def test_gather_digest_input_returns_ids_for_the_rendered_clusters(
     monkeypatch: pytest.MonkeyPatch,

@@ -248,24 +248,25 @@ _URL_RE = re.compile(r"https?://\S+")
 _QUOTE_LINE_RE = re.compile(r"^\s*>")
 
 
-def _quote_blocks(prose: str) -> list[str]:
-    """Group the prose's blockquote lines into blocks, each with its trailing context.
+#: A quoted span on a single line. The model is asked for a "verbatim quote", and when
+#: it doesn't reach for blockquote syntax it reaches for quotation marks. Requires a
+#: matched pair on one line, so an unbalanced quote inside a multi-line blockquote
+#: doesn't register.
+_QUOTED_SPAN_RE = re.compile(r'"[^"\n]+"|“[^”\n]+”')
+
+
+def _blockquote_spans(lines: list[str]) -> list[tuple[str, set[int]]]:
+    """Find blockquote blocks and the line indices each one consumes.
 
     Inputs:
-        prose: the model's markdown.
+        lines: the prose split into lines.
 
     Returns:
-        One string per quote block: the quoted lines, plus the first non-blank line
-        after them.
-
-    Why blocks rather than lines: a quote is routinely written across several ``>``
-    lines with the link on the last one, or as a quote followed by an attribution line
-    carrying the URL. Checking line-by-line would reject both of those correct shapes;
-    checking the whole document at once (the FINDING-3.5 bug) accepts a digest where
-    one quote is linked and the next is not.
+        ``(block_text, consumed_indices)`` per block. The indices let the plain-text
+        scan skip lines already accounted for, so a blockquote whose URL sits on its
+        attribution line isn't also counted as an unlinked plain-text quote.
     """
-    blocks: list[str] = []
-    lines = prose.splitlines()
+    spans: list[tuple[str, set[int]]] = []
     index = 0
 
     while index < len(lines):
@@ -274,20 +275,90 @@ def _quote_blocks(prose: str) -> list[str]:
             continue
 
         block: list[str] = []
+        consumed: set[int] = set()
         while index < len(lines) and _QUOTE_LINE_RE.match(lines[index]):
             block.append(lines[index])
+            consumed.add(index)
             index += 1
 
-        # The attribution line immediately after the quote counts as part of it.
+        # The attribution line immediately after the quote counts as part of it —
+        # unless that line is itself a quote. Absorbing it would let a linked
+        # blockquote launder the unlinked quote that follows it, which is the same
+        # hole as FINDING-4.4 one layer down.
         trailing = index
         while trailing < len(lines) and not lines[trailing].strip():
             trailing += 1
-        if trailing < len(lines) and not _QUOTE_LINE_RE.match(lines[trailing]):
+        if (
+            trailing < len(lines)
+            and not _QUOTE_LINE_RE.match(lines[trailing])
+            and not _QUOTED_SPAN_RE.search(lines[trailing])
+        ):
             block.append(lines[trailing])
+            consumed.add(trailing)
 
-        blocks.append("\n".join(block))
+        spans.append(("\n".join(block), consumed))
 
-    return blocks
+    return spans
+
+
+def _quote_blocks(prose: str) -> list[str]:
+    """Group the prose's blockquote lines into blocks, each with its trailing context.
+
+    Inputs:
+        prose: the model's markdown.
+
+    Returns:
+        One string per blockquote block: the quoted lines, plus the first non-blank
+        line after them. Plain-text quotes are not included — see ``_quote_units``.
+
+    Why blocks rather than lines: a quote is routinely written across several ``>``
+    lines with the link on the last one, or as a quote followed by an attribution line
+    carrying the URL. Checking line-by-line would reject both of those correct shapes;
+    checking the whole document at once (the FINDING-3.5 bug) accepts a digest where
+    one quote is linked and the next is not.
+    """
+    return [text for text, _ in _blockquote_spans(prose.splitlines())]
+
+
+def _quote_units(prose: str) -> list[str]:
+    """Every quote in the prose, blockquoted or not, each with its trailing context.
+
+    Inputs:
+        prose: the model's markdown.
+
+    Returns:
+        One string per quote. Each must carry its own source URL.
+
+    FINDING-4.4: enforcing links only on ``>`` blocks left the original hole open for
+    the *likelier* output shape. The prompt asks for markdown and for "the strongest
+    verbatim quote with its link" — it never asks for blockquote syntax, and the model
+    frequently writes ``Strongest quote: "…" https://…`` instead. With no blockquotes
+    in the document, the per-quote rule found nothing to check and fell through to the
+    aggregate "is there a URL anywhere" test that FINDING-3.5 was raised about.
+
+    A line already inside a blockquote block is never counted twice.
+    """
+    lines = prose.splitlines()
+    spans = _blockquote_spans(lines)
+
+    units = [text for text, _ in spans]
+    claimed = {index for _, consumed in spans for index in consumed}
+
+    for index, line in enumerate(lines):
+        if index in claimed or not _QUOTED_SPAN_RE.search(line):
+            continue
+
+        unit = [line]
+        # Same trailing-attribution allowance as blockquotes.
+        trailing = index + 1
+        while trailing < len(lines) and not lines[trailing].strip():
+            trailing += 1
+        if trailing < len(lines) and _QUOTED_SPAN_RE.search(lines[trailing]) is None:
+            unit.append(lines[trailing])
+
+        units.append("\n".join(unit))
+
+    return units
 
 
 def validate_model_output(prose: str, stop_reason: str | None) -> None:
@@ -326,17 +397,17 @@ def validate_model_output(prose: str, stop_reason: str | None) -> None:
             "digest was truncated at max_tokens; refusing to persist a partial digest"
         )
 
-    blocks = _quote_blocks(prose)
-    unlinked = [block for block in blocks if not _URL_RE.search(block)]
+    quotes = _quote_units(prose)
+    unlinked = [quote for quote in quotes if not _URL_RE.search(quote)]
     if unlinked:
         raise ValueError(
-            f"{len(unlinked)} of {len(blocks)} quotes carry no source URL (INV-10); "
+            f"{len(unlinked)} of {len(quotes)} quotes carry no source URL (INV-10); "
             f"refusing to persist it. First offender: {unlinked[0].strip()[:120]!r}"
         )
 
-    # Prose with no blockquotes at all still has to link something, or there is no
-    # outreach target anywhere in the digest.
-    if not blocks and not _URL_RE.search(prose):
+    # Prose with no recognisable quotes at all still has to link something, or there is
+    # no outreach target anywhere in the digest.
+    if not quotes and not _URL_RE.search(prose):
         raise ValueError(
             "digest contains no source URL (INV-10); refusing to persist it"
         )

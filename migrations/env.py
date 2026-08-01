@@ -63,8 +63,29 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-def _do_run(connection: object) -> None:
+def _do_run(connection: object, *, ahead_on_opt_in_chain: bool = False) -> None:
+    """Configure the migration context and run, unless this upgrade has nothing to do.
+
+    Inputs:
+        connection: the sync connection handed over by ``run_sync``.
+        ahead_on_opt_in_chain: from the probe — the database sits on a revision that
+            belongs to the opt-in chain rather than this configuration's.
+
+    The upgrade test happens *here*, after ``configure()``, because that is the first
+    point at which the running command is knowable: ``alembic.context`` is a module of
+    proxy functions, not the EnvironmentContext instance, so ``context_opts`` is not
+    reachable before this. ``configure()`` copies those options onto the
+    MigrationContext, where ``fn`` is the per-command migration function.
+    """
     _configure(connection)
+
+    if ahead_on_opt_in_chain and _is_upgrade():
+        log.info(
+            "database is ahead on the opt-in chain; this configuration has nothing "
+            "to upgrade. Use alembic.deferred.ini to manage that chain."
+        )
+        return
+
     with context.begin_transaction():
         context.run_migrations()
 
@@ -88,6 +109,27 @@ def _opt_in_revisions() -> set[str]:
 def _managed_revisions() -> set[str]:
     """Revision ids this Alembic configuration knows about."""
     return {script.revision for script in ScriptDirectory.from_config(config).walk_revisions()}
+
+
+def _is_upgrade() -> bool:
+    """True when the running Alembic command is ``upgrade``.
+
+    Returns:
+        Whether this env.py invocation is serving an upgrade.
+
+    FINDING-4.6: the opt-in tolerance below must apply to the deployment upgrade path
+    and nothing else. Applied to every command, it made ``downgrade base`` exit 0
+    while leaving the schema fully intact — a command reporting success for work it
+    did not do, which is worse than the error it was suppressing.
+
+    Alembic passes the per-command migration function as ``fn``; ``upgrade`` and
+    ``downgrade`` are named after their commands, ``stamp`` arrives as ``do_stamp``.
+    Anything that is not an upgrade falls through to Alembic's own error.
+
+    Only callable after ``context.configure()`` — see ``_do_run``.
+    """
+    fn = context.get_context().opts.get("fn")
+    return getattr(fn, "__name__", "") == "upgrade"
 
 
 async def _database_is_ahead_on_opt_in_chain(connection: object) -> bool:
@@ -142,12 +184,13 @@ async def _run_async() -> None:
         # back when the connection closes — migrations report success and change
         # nothing.
         async with engine.connect() as probe:
-            skip = await _database_is_ahead_on_opt_in_chain(probe)
-        if skip:
-            return
+            ahead = await _database_is_ahead_on_opt_in_chain(probe)
 
         async with engine.connect() as connection:
-            await connection.run_sync(_do_run)
+            # The skip decision is applied inside _do_run, which is the first place
+            # that knows whether this is an upgrade. A downgrade must still reach
+            # Alembic and fail on the revision it cannot resolve (FINDING-4.6).
+            await connection.run_sync(_do_run, ahead_on_opt_in_chain=ahead)
     finally:
         await engine.dispose()
 

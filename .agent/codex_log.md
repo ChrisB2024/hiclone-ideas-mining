@@ -528,3 +528,109 @@ Rejected:
 - Builder action: fix `FINDING-3.3`, `FINDING-3.4`, and `FINDING-3.5`.
 - `TEST-CONFLICT-3.1` is resolved and removed from `open_blockers`.
 - `OQ-6` remains `needs: human`.
+
+---
+
+## Session 4 — 2026-08-01 — CYCLE-4 FIX VALIDATION
+
+### Context
+Read the cycle-4 handoff, Claude session 4 in full, all changed source, and the DB,
+cluster, digest, and system specs. Set the handoff to `VALIDATING` before work. Claude's
+cycle-4 source was already committed as `35c1fb9`; no Builder-owned source was modified.
+
+### Test coverage changed
+
+- Exercised `_quote_blocks()` directly for multiline, attribution, nested, and no-blockquote
+  shapes, plus a ten-quote/nine-link rejection.
+- Added an adversarial plain-text quote shape because the prompt requires Markdown but does
+  not require blockquote syntax.
+- Expanded disposable-database migration coverage for fresh-schema creation, an unknown
+  revision, a default downgrade after opt-in, and a pre-existing wrong-opclass index.
+- Added a live lock test: hold one pipeline write open, start the concurrent HNSW migration,
+  then prove a second pipeline write commits before the first writer is released.
+
+### Results
+
+- Focused Docker run: **18 passed, 3 failed**.
+- Final full clean Linux run inside the Compose network: **109 passed, 3 failed**.
+- The three failures are distinct production defects; there were no setup or harness
+  failures.
+- The live concurrent-write test, unknown-revision boundary, fresh five-table migration,
+  documented blockquote shapes, and ten-quote/nine-link rejection all pass.
+
+### Docker and live database validation
+
+- `docker compose config --quiet` passes; PostgreSQL and Redis are healthy and loopback
+  bound; Redis returns `PONG`.
+- Validation used a clean Python 3.13 container on `ideas-mining_default`, so the host's
+  unrelated PostgreSQL on port 5432 was not touched.
+- The Compose database remains at revision 0001 with zero HNSW indexes and zero invalid
+  indexes. The temporary Validator container was removed; Compose services remain running.
+
+### CodeRabbit review
+
+Two scopes were required because the cycle-4 source was already committed:
+
+1. `--committed --base-commit bb6fd602deb39ac3cbca95240ef319ea994b9bee`.
+2. `--uncommitted --include-untracked` for Validator-owned tests.
+
+Confirmed:
+
+- Major: an existing invalid or wrong-opclass index is accepted by `IF NOT EXISTS`, after
+  which Alembic records 0002 (`FINDING-4.5`). Reproduced with `vector_l2_ops`.
+- Major: the opt-in revision early return applies to every Alembic operation, so a default
+  `downgrade base` exits 0 without doing anything (`FINDING-4.6`). Reproduced live.
+- Validator cleanup: `_temporary_database()` now guarantees the admin connection closes
+  even if database creation or cleanup fails.
+
+Rejected:
+
+- Requiring purpose/input/output/security docstrings on every test is style feedback, not a
+  false-confidence or production-risk finding under the Validator instructions.
+
+### Findings
+
+#### [FINDING-4.1] [PASSED] — default deployment and revision boundary
+- A fresh default upgrade creates all five tables at 0001; a later default upgrade after
+  opt-in exits 0; a revision in neither chain still fails loudly.
+- Traces to: `DECISION-4.1`, `INV-5`.
+
+#### [FINDING-4.2] [PASSED] — concurrent HNSW construction permits writes
+- With one write transaction held open, the live `CREATE INDEX CONCURRENTLY` remained
+  active while a second pipeline write committed under a two-second statement timeout.
+- Traces to: `DECISION-4.2`, `INV-5`.
+
+#### [FINDING-4.3] [PASSED] — documented blockquote URL shapes
+- Multiline quotes, trailing attribution links, nested blockquotes, and no-blockquote prose
+  behave as documented. Ten blockquotes with nine links are rejected and identify the
+  offender.
+- Traces to: `DECISION-4.3`, `INV-10`.
+
+#### [FINDING-4.4] [FAILED] — plain-text quotes still use aggregate URL validation
+- Two `Strongest quote:` lines with only one URL are accepted because `_quote_blocks()`
+  returns no blocks and the fallback checks only whether the whole document has a URL.
+  The model prompt does not require `>` syntax, but `INV-10` applies to every quote.
+- Traces to: `DECISION-4.3`, `INV-10`.
+
+#### [FINDING-4.5] [FAILED] — wrong existing HNSW index is stamped as migrated
+- A pre-existing `ix_signals_embedding_hnsw` using `vector_l2_ops` makes
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS` skip creation. Alembic still records 0002,
+  leaving the production query on the wrong distance operator. The same mechanism accepts
+  an invalid leftover from a failed concurrent build.
+- Traces to: `DECISION-4.2`, `INV-5`.
+
+#### [FINDING-4.6] [FAILED] — non-upgrade Alembic commands silently no-op
+- After opt-in reaches 0002, default `alembic downgrade base` exits 0 with empty output but
+  leaves revision 0002 and all tables intact. The tolerance early return must be scoped to
+  the intended deployment upgrade path; unsupported commands must not report false success.
+- Traces to: `DECISION-4.1`, `INV-5`, DB migration testing requirements.
+
+#### [FINDING-4.7] [BLOCKER] — manual quality acceptance remains human-owned
+- Pain-point normalization, vertical disagreements, and digest usefulness still require a
+  human reading actual model output.
+- Traces to: `OQ-6`, `INV-1`, `INV-10`.
+
+### Handoff
+- Status: `VALIDATION_COMPLETE`; turn returned to Claude.
+- Builder action: fix `FINDING-4.4`, `FINDING-4.5`, and `FINDING-4.6`.
+- `OQ-6` remains `needs: human`.

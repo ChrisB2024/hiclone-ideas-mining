@@ -2,54 +2,64 @@
   "protocol": "DADP",
   "version": "1.0",
   "project": "ideas-mining",
-  "cycle": 4,
+  "cycle": 5,
   "turn": "codex",
   "status": "READY_FOR_VALIDATION",
-  "updated_at": "2026-08-01T16:54:25Z",
+  "updated_at": "2026-08-01T18:01:06Z",
   "spec_ref": ".spec/system_spec.md",
   "last_build": {
-    "cycle": 4,
+    "cycle": 5,
     "modules": [
-      "db",
-      "digest"
+      "digest",
+      "db"
     ],
     "files_written": [],
     "files_modified": [
-      "migrations/env.py",
-      "migrations/deferred/0002_hnsw_indexes.py",
       "ideas_mining/digest.py",
+      "migrations/deferred/0002_hnsw_indexes.py",
+      "migrations/env.py",
       ".agent/claude_log.md"
     ],
     "decisions": [
       {
-        "id": "DECISION-4.1",
-        "summary": "env.py tolerates a database ahead on the opt-in chain - FINDING-3.3",
-        "rationale": "Fixes a bug I introduced in DECISION-3.2. Hiding 0002 from the default version_locations stopped `alembic upgrade head` applying it, but also stopped the default config recognising a database that had legitimately applied it - so every ordinary deploy after the opt-in died with 'Can't locate revision identified by 0002'. I changed what the tool can see rather than what it does, and the consequence landed in the one place nobody tests: the second deploy.",
-        "tradeoff": "env.py now knows migrations/deferred/ exists. Deliberately NOT a blanket ignore - a revision in neither chain still raises.",
-        "affects": [
-          "db"
-        ],
-        "test_implication": "Assert the tolerance boundary: an unknown revision in neither chain must still fail loudly. Also assert a FRESH database still gets all five tables - the probe originally shared Alembic's connection, leaving an open transaction that silently rolled the migration back while reporting success."
-      },
-      {
-        "id": "DECISION-4.2",
-        "summary": "CREATE INDEX CONCURRENTLY inside an autocommit block - FINDING-3.4",
-        "rationale": "Plain CREATE INDEX takes a SHARE lock blocking every INSERT/UPDATE for the whole build, on the two tables the pipeline writes to every tick and on a table that by definition holds thousands of rows by the time this is worth running. CONCURRENTLY cannot run inside a transaction because it must see other transactions commit between its two passes.",
-        "tradeoff": "Those statements lose the migration's transaction: if the second index fails the first is already committed. Both use IF NOT EXISTS. A failed concurrent build leaves an INVALID index that still slows writes and that IF NOT EXISTS considers present - the detection query is documented in the migration.",
-        "affects": [
-          "db"
-        ],
-        "test_implication": "Assert both CONCURRENTLY statements and the autocommit block; verify pg_index reports no invalid indexes after a real build."
-      },
-      {
-        "id": "DECISION-4.3",
-        "summary": "Digest URL validation is per quote, not per document - FINDING-3.5",
-        "rationale": "_URL_RE.search(prose) asked whether the document contains a link anywhere, which one linked quote satisfied for all ten. The realistic failure is the model dropping some links, not all of them.",
-        "tradeoff": "Needs a notion of what a quote is. Blocks (consecutive `>` lines plus the first non-blank line after) rather than lines, because a quote is routinely split across lines with the link last, or followed by an attribution line carrying the URL.",
+        "id": "DECISION-5.1",
+        "summary": "Quote detection covers plain-text quotes, not just blockquotes - FINDING-4.4",
+        "rationale": "Cycle 4 enforced links per '>' block. The prompt asks for markdown and for a verbatim quote with its link, but never for blockquote syntax; the model frequently writes 'Strongest quote: \"...\" https://...'. With no blockquotes present the per-quote rule found nothing and fell through to the aggregate check FINDING-3.5 was raised about. I validated a format the producer never promised.",
+        "tradeoff": "Needs a heuristic for what a quote is. Keyed on a quotation-marked span, which is what the model actually produces.",
         "affects": [
           "digest"
         ],
-        "test_implication": "Multi-line quotes with a trailing link, quote-then-blank-then-attribution, nested >>, prose with no quotes, and a ten-quote/nine-link digest that must name its offender."
+        "test_implication": "Plain-text quotes with and without links; ensure _quote_blocks keeps its blockquote-only meaning."
+      },
+      {
+        "id": "DECISION-5.2",
+        "summary": "Two further holes found by hand, not by the suite",
+        "rationale": "(a) the quoted-span regex required 2+ inner characters, so 'A' was invisible and short quotes produced zero units. (b) MORE SERIOUS: the trailing-attribution rule absorbed the next non-blank line into a blockquote, so a linked blockquote followed by an unlinked plain-text quote swallowed the latter and the digest was ACCEPTED - a live INV-10 violation that passed every test in the suite. The trailing line is now only absorbed when it is not itself a quote.",
+        "tradeoff": "An attribution line that happens to contain quotation marks is now treated as its own quote and must carry a URL.",
+        "affects": [
+          "digest"
+        ],
+        "test_implication": "HIGHEST VALUE REGRESSION THIS CYCLE: linked blockquote immediately followed by an unlinked plain-text quote must be rejected. Also single-character quoted spans and smart quotes."
+      },
+      {
+        "id": "DECISION-5.3",
+        "summary": "Opt-in migration reconciles a wrong or invalid existing index - FINDING-4.5",
+        "rationale": "IF NOT EXISTS matches on the index NAME only, so an invalid leftover from a failed concurrent build, or an index on the wrong operator class, is accepted and Alembic then records 0002. specs/04 warns the wrong opclass silently gives worse neighbours rather than erroring; this made that silent failure reachable through the documented procedure and stamped as done.",
+        "tradeoff": "The migration now drops an index it did not create. Safe because both names are owned by this migration. Offline --sql mode skips reconciliation, which needs a connection.",
+        "affects": [
+          "db"
+        ],
+        "test_implication": "The INVALID-index half is untested (Codex reproduced wrong-opclass only); build one by cancelling a concurrent build. Also assert offline --sql still emits both statements."
+      },
+      {
+        "id": "DECISION-5.4",
+        "summary": "Opt-in tolerance applies to `upgrade` only - FINDING-4.6",
+        "rationale": "DECISION-4.1 made EVERY alembic command a no-op on an opt-in database: `downgrade base` exited 0, printed nothing, and left all five tables and revision 0002 intact. A command reporting success for work it did not do is worse than the error it suppressed - the error is survivable, the false success is what you act on.",
+        "tradeoff": "Depends on Alembic naming its per-command migration function (`upgrade`/`downgrade`/`do_stamp`). First attempt read context.context_opts in env.py, which does not exist there because alembic.context is a module of proxy FUNCTIONS, not the EnvironmentContext - it silently read {} and disabled the tolerance entirely. The check now runs after context.configure(), which copies those options onto the MigrationContext.",
+        "affects": [
+          "db"
+        ],
+        "test_implication": "`stamp` and `history` on an opt-in database must also not report false success - only `downgrade` was reproduced."
       }
     ],
     "invariants_asserted": [
@@ -58,22 +68,24 @@
     ],
     "spec_deviations": [],
     "test_targets": [
-      "_quote_blocks directly: multi-line quotes with the link on the last line; quote, blank line, then attribution carrying the URL; nested >>; prose with no quotes at all",
-      "A digest with ten quotes and nine links is rejected and names the offender",
-      "env.py tolerance boundary: a revision in NEITHER chain must still fail loudly (stops DECISION-4.1 degenerating into 'ignore unknown revisions')",
-      "alembic upgrade head on a FRESH database still creates all five tables - regression hit during this build, where a shared probe connection rolled the migration back while reporting success",
-      "Concurrent index construction under concurrent writes if cheap to arrange; otherwise assert the autocommit block and IF NOT EXISTS textually",
-      "Re-running the opt-in config when both indexes already exist is a no-op (IF NOT EXISTS)"
+      "HIGHEST VALUE: a linked blockquote immediately followed by an unlinked plain-text quote must be rejected - this violated INV-10 while passing every existing test",
+      "Single-character quoted spans (\"A\") are detected as quotes at all",
+      "Smart quotes are treated as quotes",
+      "A quote whose URL is a markdown link [text](https://...) - unverified shape, _URL_RE should match inside it but nothing asserts that",
+      "alembic stamp and alembic history on an opt-in database must not report false success (only downgrade was reproduced)",
+      "The reconcile path for an INVALID index specifically - the wrong-opclass half is covered, the invalid half shares the mechanism but is untested",
+      "Offline `alembic -c alembic.deferred.ini upgrade head --sql` still emits both CREATE statements without inspecting a connection"
     ],
     "known_edge_cases": [
-      "FULL SUITE: 102 passed, 0 failed, 0 SKIPPED. Integration tests ran on the Builder's machine for the first time, against a throwaway PostgreSQL 16.13 + pgvector 0.8.5 cluster on port 55440 (the host's Homebrew cluster owns 5432 and holds four unrelated project databases; the integration conftest TRUNCATEs, so it could not be pointed there).",
-      "Migration lifecycle verified by hand against the database: default -> 0001/0 indexes; opt-in -> 0002/2 indexes, both vector_cosine_ops, zero invalid; default again -> rc 0, unchanged; opt-in downgrade -> 0001/0 indexes.",
-      "A failed CONCURRENTLY build leaves an invalid index that IF NOT EXISTS treats as present. Detection query is in the migration docstring."
+      "FULL SUITE: 112 passed, 0 failed, 0 skipped, against PostgreSQL 16.13 + pgvector 0.8.5 on port 55440.",
+      "Hand-verified: planting a vector_l2_ops index then opting in reconciles it to vector_cosine_ops and valid; default `downgrade base` after opt-in exits 255 with the schema intact; default `upgrade head` after opt-in still exits 0.",
+      "PATTERN WORTH NOTING: all three cycle-4 findings, and both extra holes found this cycle, were cases where a fix was correct for the shape it was tested against and wrong just outside it. Two of them produced SILENT NO-OPS rather than errors.",
+      "_quote_units treats any quotation-marked line as a quote needing a URL. An attribution line containing quotation marks will now be required to carry one."
     ],
-    "log_anchor": "claude_log.md#session-4"
+    "log_anchor": "claude_log.md#session-5"
   },
   "last_validation": {
-    "cycle": 3,
+    "cycle": 4,
     "test_files": [
       "pytest.ini",
       "tests/test_config_and_targets.py",
@@ -91,7 +103,7 @@
       "tests/integration/test_migrations.py"
     ],
     "results": {
-      "passed": 99,
+      "passed": 109,
       "failed": 3,
       "distinct_failed_findings": 3,
       "blockers": 1
@@ -106,115 +118,67 @@
     },
     "findings": [
       {
-        "id": "FINDING-3.1",
+        "id": "FINDING-4.1",
         "status": "PASSED",
-        "target": "pyproject.toml",
-        "detail": "A clean install pulls greenlet through sqlalchemy[asyncio], and its Alembic executable migrates a fresh database.",
+        "target": "migrations/env.py",
+        "detail": "A fresh upgrade creates all five tables; a later default upgrade after opt-in exits successfully; revisions in neither chain still fail loudly.",
         "traces_to": [
-          "DECISION-3.1",
+          "DECISION-4.1",
           "INV-5"
         ]
       },
       {
-        "id": "FINDING-3.2",
+        "id": "FINDING-4.2",
         "status": "PASSED",
-        "target": "alembic.ini, alembic.deferred.ini, migrations/deferred/0002_hnsw_indexes.py",
-        "detail": "Default head is 0001 with zero HNSW indexes; the opt-in config sees 0002 and creates exactly two cosine indexes. TEST-CONFLICT-3.1 is resolved.",
-        "traces_to": [
-          "DECISION-3.2",
-          "TEST-CONFLICT-3.1"
-        ]
-      },
-      {
-        "id": "FINDING-3.3",
-        "status": "FAILED",
-        "target": "alembic.deferred.ini, migrations/deferred/0002_hnsw_indexes.py",
-        "detail": "After the deferred command records 0002, the next normal alembic upgrade head exits 255 because the default configuration cannot locate revision 0002.",
-        "traces_to": [
-          "DECISION-3.2",
-          "INV-5"
-        ]
-      },
-      {
-        "id": "FINDING-3.4",
-        "status": "FAILED",
         "target": "migrations/deferred/0002_hnsw_indexes.py",
-        "detail": "HNSW indexes use blocking CREATE INDEX inside a transaction even though the deployed PostgreSQL and pgvector support concurrent HNSW construction.",
+        "detail": "A live concurrent HNSW build permits a second pipeline write while an earlier write transaction remains open.",
         "traces_to": [
-          "DECISION-3.2",
+          "DECISION-4.2",
           "INV-5"
         ]
       },
       {
-        "id": "FINDING-3.5",
-        "status": "FAILED",
+        "id": "FINDING-4.3",
+        "status": "PASSED",
         "target": "ideas_mining/digest.py",
-        "detail": "Aggregate URL validation accepts a digest with one linked quote and another unlinked quote, violating the per-quote requirement.",
+        "detail": "Documented blockquote shapes work, and ten blockquotes with nine links are rejected while naming the offender.",
         "traces_to": [
-          "DECISION-3.3",
+          "DECISION-4.3",
           "INV-10"
         ]
       },
       {
-        "id": "FINDING-3.6",
-        "status": "PASSED",
+        "id": "FINDING-4.4",
+        "status": "FAILED",
         "target": "ideas_mining/digest.py",
-        "detail": "Blank, truncated, and fully linkless output is rejected before persistence or delivery; cluster IDs come from the ranking used for the prompt.",
+        "detail": "Two plain-text Strongest quote entries with one aggregate URL are accepted because per-quote enforcement only recognizes Markdown blockquotes.",
         "traces_to": [
-          "DECISION-3.3",
-          "DECISION-3.4",
-          "INV-5",
-          "INV-10",
-          "INV-11"
+          "DECISION-4.3",
+          "INV-10"
         ]
       },
       {
-        "id": "FINDING-3.7",
-        "status": "PASSED",
-        "target": "ideas_mining/enrich.py",
-        "detail": "An accepted batch ID is logged at ERROR if tracking persistence fails, and the exception still propagates.",
+        "id": "FINDING-4.5",
+        "status": "FAILED",
+        "target": "migrations/deferred/0002_hnsw_indexes.py",
+        "detail": "IF NOT EXISTS accepts an existing wrong-opclass or invalid HNSW index and Alembic still records revision 0002.",
         "traces_to": [
-          "DECISION-3.5",
+          "DECISION-4.2",
           "INV-5"
         ]
       },
       {
-        "id": "FINDING-3.8",
-        "status": "PASSED",
-        "target": "ideas_mining/ingest/reddit.py, ideas_mining/ingest/hackernews.py",
-        "detail": "Reddit preserves partial progress across three failure domains; HN isolates unusable timestamps and attaches UTC to naive values.",
+        "id": "FINDING-4.6",
+        "status": "FAILED",
+        "target": "migrations/env.py",
+        "detail": "After opt-in, default alembic downgrade base exits 0 without changing the revision or removing any schema because the early return is not scoped to upgrade.",
         "traces_to": [
-          "DECISION-3.6",
-          "DECISION-3.7",
-          "INV-3",
+          "DECISION-4.1",
           "INV-5"
         ]
       },
       {
-        "id": "FINDING-3.9",
-        "status": "PASSED",
-        "target": "ideas_mining/cluster.py",
-        "detail": "DELETE-based reclustering is FK-safe on live PostgreSQL and preserves embeddings.",
-        "traces_to": [
-          "DECISION-3.8",
-          "INV-2",
-          "INV-5",
-          "INV-6"
-        ]
-      },
-      {
-        "id": "FINDING-3.10",
-        "status": "PASSED",
-        "target": "docker-compose.yml, ideas_mining/worker.py",
-        "detail": "Compose services are healthy and loopback-bound; invalid log levels safely fall back to INFO.",
-        "traces_to": [
-          "DECISION-3.9",
-          "DECISION-3.10",
-          "INV-5"
-        ]
-      },
-      {
-        "id": "FINDING-3.11",
+        "id": "FINDING-4.7",
         "status": "BLOCKER",
         "target": "manual LLM and digest acceptance criteria",
         "detail": "Pain-point normalization, vertical disagreements, and digest usefulness still require human review of actual model output.",
@@ -227,22 +191,21 @@
     ],
     "coderabbit": {
       "mode": "light",
-      "committed_base": "19da329",
-      "committed_findings": 3,
-      "uncommitted_findings": 3,
+      "committed_base": "bb6fd602deb39ac3cbca95240ef319ea994b9bee",
+      "committed_findings": 2,
+      "uncommitted_findings": 2,
       "confirmed_source_findings": 2,
       "test_feedback_applied": 1,
-      "rejected": 2,
-      "handoff_feedback_completed": 1
+      "rejected": 1
     },
-    "log_anchor": "codex_log.md#session-3"
+    "log_anchor": "codex_log.md#session-4"
   },
   "open_blockers": [
     {
       "id": "OQ-6",
       "severity": "BLOCKER",
       "target": ".spec/system_spec.md",
-      "detail": "Manual LLM and digest quality criteria have no assertion form: pain-point normalization, vertical disagreements, and digest usefulness need a human reading real model output. Unchanged since cycle 1 and now the only open item in the protocol.",
+      "detail": "Manual LLM and digest quality criteria have no assertion form: pain-point normalization, vertical disagreements, and digest usefulness need a human reading real model output. The pipeline has still never run against real data, so these cannot be exercised yet.",
       "traces_to_decision": null,
       "needs": "human"
     }
