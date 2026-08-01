@@ -47,16 +47,40 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.execute(
-        "CREATE INDEX ix_signals_embedding_hnsw ON enriched_signals "
-        "USING hnsw (embedding vector_cosine_ops)"
-    )
-    op.execute(
-        "CREATE INDEX ix_clusters_centroid_hnsw ON clusters "
-        "USING hnsw (centroid vector_cosine_ops)"
-    )
+    """Build both hnsw indexes without holding a write lock (FINDING-3.4).
+
+    ``CREATE INDEX`` takes a ``SHARE`` lock, which blocks every INSERT and UPDATE on
+    the table for the whole build. On ``enriched_signals`` — the table this migration
+    only becomes worth running on once it holds thousands of rows — that is a stall
+    measured in minutes, and it lands on the two tables the pipeline writes to on every
+    tick. ``CONCURRENTLY`` builds in two passes and never blocks writers.
+
+    ``CONCURRENTLY`` cannot run inside a transaction, and Alembic wraps migrations in
+    one, so both statements go in an ``autocommit_block``.
+
+    The cost of that block: these statements are no longer covered by the migration's
+    transaction. If the second index fails, the first is already committed. Both use
+    ``IF NOT EXISTS`` so a re-run is safe.
+
+    One caveat worth knowing before you run this on real data: a ``CONCURRENTLY`` build
+    that fails partway leaves an **invalid** index behind. It is not used for queries
+    but it does slow writes, and ``IF NOT EXISTS`` will consider it present. Check with
+    ``SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid`` and drop any
+    invalid leftovers before re-running.
+    """
+    with op.get_context().autocommit_block():
+        op.execute(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_signals_embedding_hnsw "
+            "ON enriched_signals USING hnsw (embedding vector_cosine_ops)"
+        )
+        op.execute(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_clusters_centroid_hnsw "
+            "ON clusters USING hnsw (centroid vector_cosine_ops)"
+        )
 
 
 def downgrade() -> None:
-    op.execute("DROP INDEX IF EXISTS ix_clusters_centroid_hnsw")
-    op.execute("DROP INDEX IF EXISTS ix_signals_embedding_hnsw")
+    """Drop both indexes, also concurrently — a plain DROP INDEX takes ACCESS EXCLUSIVE."""
+    with op.get_context().autocommit_block():
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_clusters_centroid_hnsw")
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_signals_embedding_hnsw")

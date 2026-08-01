@@ -7,14 +7,32 @@ The database URL comes from ``settings``, never from alembic.ini and never from
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
+from pathlib import Path
 
 from alembic import context
+from alembic.script import ScriptDirectory
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from ideas_mining.config import settings
 from ideas_mining.db.models import Base
 
+log = logging.getLogger("alembic.env")
+
 config = context.config
+
+MIGRATIONS_DIR = Path(__file__).parent
+#: Opt-in migrations, applied only via alembic.deferred.ini. Not in this config's
+#: version_locations, which is what keeps `alembic upgrade head` from applying them.
+DEFERRED_DIR = MIGRATIONS_DIR / "deferred"
+
+#: Matches the `revision: str = "0002"` line our template generates. Deliberately a
+#: text scan rather than an import or an Alembic RevisionMap: building a map over the
+#: deferred directory alone would fail, because those revisions point at a
+#: down_revision that lives in the other directory.
+_REVISION_RE = re.compile(r"^revision(?:\s*:\s*str)?\s*=\s*[\"']([^\"']+)[\"']", re.M)
 
 #: Autogenerate compares against this. Importing models also runs the embedding_dim
 #: guard, so a migration can never be generated against an unset vector dimension.
@@ -51,11 +69,87 @@ def _do_run(connection: object) -> None:
         context.run_migrations()
 
 
+def _opt_in_revisions() -> set[str]:
+    """Revision ids that live in migrations/deferred/ — the opt-in chain.
+
+    Returns:
+        The set of revision ids, empty if the directory is absent.
+    """
+    if not DEFERRED_DIR.is_dir():
+        return set()
+    found: set[str] = set()
+    for path in DEFERRED_DIR.glob("*.py"):
+        match = _REVISION_RE.search(path.read_text(encoding="utf-8"))
+        if match:
+            found.add(match.group(1))
+    return found
+
+
+def _managed_revisions() -> set[str]:
+    """Revision ids this Alembic configuration knows about."""
+    return {script.revision for script in ScriptDirectory.from_config(config).walk_revisions()}
+
+
+async def _database_is_ahead_on_opt_in_chain(connection: object) -> bool:
+    """True when the database sits on an opt-in revision this config doesn't manage.
+
+    Inputs:
+        connection: an open async connection.
+
+    Returns:
+        True if migrations should be skipped, False to proceed normally.
+
+    FINDING-3.3. Keeping the deferred revision out of the default config's
+    ``version_locations`` is what stops ``alembic upgrade head`` applying it — but it
+    also meant the default config could no longer *recognise* a database that had
+    legitimately applied it. Once someone ran the opt-in command, every subsequent
+    ordinary deploy died with ``Can't locate revision identified by '0002'``. The
+    deferral fix had made routine deployment fragile, which is a worse bug than the one
+    it solved.
+
+    The distinction that matters: a stored revision that belongs to the opt-in chain
+    means the database is *ahead* of this config and there is nothing to do. A stored
+    revision that belongs to neither chain is real corruption or a rollback to an
+    older checkout, and still raises — this is deliberately not a blanket
+    "ignore unknown revisions".
+    """
+    stored = await connection.scalar(text("SELECT to_regclass('alembic_version')"))
+    if stored is None:
+        return False  # fresh database, nothing recorded yet
+
+    current = await connection.scalar(text("SELECT version_num FROM alembic_version"))
+    if current is None or current in _managed_revisions():
+        return False
+
+    if current in _opt_in_revisions():
+        log.info(
+            "database is at opt-in revision %s, which this configuration does not "
+            "manage; nothing to upgrade. Use alembic.deferred.ini for that chain.",
+            current,
+        )
+        return True
+
+    # Unknown to both chains — let Alembic raise its own, more informative error.
+    return False
+
+
 async def _run_async() -> None:
     engine = create_async_engine(settings.database_url, pool_pre_ping=True)
-    async with engine.connect() as connection:
-        await connection.run_sync(_do_run)
-    await engine.dispose()
+    try:
+        # The probe gets its own connection on purpose. Querying first on the
+        # connection Alembic then migrates over leaves an open transaction, so
+        # Alembic's own `begin_transaction()` nests inside it and everything is rolled
+        # back when the connection closes — migrations report success and change
+        # nothing.
+        async with engine.connect() as probe:
+            skip = await _database_is_ahead_on_opt_in_chain(probe)
+        if skip:
+            return
+
+        async with engine.connect() as connection:
+            await connection.run_sync(_do_run)
+    finally:
+        await engine.dispose()
 
 
 def run_migrations_online() -> None:

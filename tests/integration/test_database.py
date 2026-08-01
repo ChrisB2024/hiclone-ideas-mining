@@ -325,6 +325,10 @@ async def test_recluster_all_clears_referenced_clusters_without_fk_failure(
         "insurance",
         embedding=VECTOR,
     )
+    embedding_before = await clean_database.fetchval(
+        "SELECT embedding::text FROM enriched_signals WHERE raw_post_id = $1",
+        raw_post_id,
+    )
     assert await assign_clusters() == {"created": 1, "assigned": 1}
 
     async def do_not_reassign(ctx: object | None = None) -> dict[str, int]:
@@ -341,4 +345,11 @@ async def test_recluster_all_clears_referenced_clusters_without_fk_failure(
             "SELECT count(*) FROM enriched_signals WHERE cluster_id IS NOT NULL"
         )
         == 0
+    )
+    assert (
+        await clean_database.fetchval(
+            "SELECT embedding::text FROM enriched_signals WHERE raw_post_id = $1",
+            raw_post_id,
+        )
+        == embedding_before
     )

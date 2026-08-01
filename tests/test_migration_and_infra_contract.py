@@ -69,13 +69,31 @@ def test_deferred_hnsw_migration_is_not_alembic_head() -> None:
     assert scripts.get_current_head() == "0001"
 
 
+def test_deferred_alembic_config_exposes_hnsw_as_its_head() -> None:
+    config = Config(str(ROOT / "alembic.deferred.ini"))
+    scripts = ScriptDirectory.from_config(config)
+
+    assert scripts.get_current_head() == "0002"
+    assert scripts.get_revision("0002").down_revision == "0001"
+
+
 def test_hnsw_migration_uses_cosine_operator_class() -> None:
     source = (
-        ROOT / "migrations/versions/0002_hnsw_indexes.py"
+        ROOT / "migrations/deferred/0002_hnsw_indexes.py"
     ).read_text()
 
     assert source.count("vector_cosine_ops") >= 2
     assert "vector_l2_ops" not in source
+
+
+def test_deferred_hnsw_indexes_do_not_block_pipeline_writes() -> None:
+    source = (
+        ROOT / "migrations/deferred/0002_hnsw_indexes.py"
+    ).read_text()
+    normalized = " ".join(source.upper().split())
+
+    assert normalized.count("CREATE INDEX CONCURRENTLY") >= 2
+    assert "AUTOCOMMIT_BLOCK" in normalized
 
 
 def test_local_compose_ports_are_bound_to_loopback() -> None:

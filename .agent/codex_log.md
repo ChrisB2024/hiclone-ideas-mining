@@ -376,3 +376,155 @@ Rejected:
 - Builder should fix `FINDING-2.4` through `FINDING-2.14` and rerun the added regressions.
 - `OQ-2` and `OQ-3` are now verified with a real PostgreSQL+pgvector runtime.
 - `OQ-6` remains human-owned.
+
+---
+
+## Session 3 — 2026-08-01 — CYCLE-3 FIX VALIDATION
+
+### Context
+Read `.agent/handoff.json` (`last_build.cycle = 3`, `turn: codex`), Claude session 3 in
+full, every file in the cycle-3 build manifest, the system spec, and all 8 module specs.
+The cycle-3 build was already committed and pushed as `eb39940` and `bb6fd60`; Validator
+changes remain uncommitted. No Builder-owned source was modified.
+
+### Test coverage changed
+
+- Resolved `TEST-CONFLICT-3.1` by following the HNSW migration to
+  `migrations/deferred/0002_hnsw_indexes.py`.
+- Added direct digest validation for blank, truncated, valid-linked, and partially-linked
+  multi-quote output; rejected output must write no row/file and attempt no SMTP delivery.
+- Added a direct `gather_digest_input()` prompt/cluster-id coupling test.
+- Added HN missing/null/numeric/unparseable/naive timestamp cases.
+- Added all three Reddit failure domains: bad submission, failed comment tree, and listing
+  failure after partial progress.
+- Added worker log-level padding/case/unknown/numeric-string cases.
+- Strengthened live reclustering to assert embeddings survive.
+- Added both Alembic configuration checks, non-blocking HNSW construction, and a disposable
+  database test proving the normal migration path remains usable after optional indexes.
+- Added a 120-second timeout to every Alembic subprocess used by integration tests.
+
+### Results
+
+- Claude baseline: **71 passed, 1 failed, 12 skipped**. The failure was the stale
+  Validator-owned migration path.
+- Focused/unit suite after cycle-3 tests: **87 passed, 2 failed, 13 deselected**.
+- Live integration suite: **12 passed, 1 failed, 89 deselected**.
+- Final clean Linux run inside the Compose network: **99 passed, 3 failed**.
+- Clean install: a brand-new venv installed `greenlet 3.5.4` via
+  `sqlalchemy[asyncio]` and successfully migrated a fresh database to 0001.
+
+The three failing tests represent three distinct production defects; there are no setup or
+test-harness failures.
+
+### Docker and live database validation
+
+- Docker Engine 29.4.0 and Compose 5.1.2 are installed.
+- `docker compose config --quiet` passes.
+- `postgres` (`pgvector/pgvector:pg16`) and `redis` (`redis:7-alpine`) are healthy and
+  loopback-bound; Redis returns `PONG`.
+- Docker PostgreSQL is 16.14 with pgvector 0.8.6.
+- A clean Python 3.13 container on `ideas-mining_default` installed the declared package and
+  test dependencies, then ran the full suite against `postgres:5432`.
+- Default `alembic upgrade head` records 0001 and creates zero HNSW indexes.
+- `downgrade base` removes all five application tables; re-upgrade recreates all five.
+- The opt-in config applies exactly two `vector_cosine_ops` HNSW indexes.
+- This pgvector/PostgreSQL pair successfully creates and drops an HNSW index with
+  `CREATE INDEX CONCURRENTLY`, so no compatibility-based maintenance-window exception is
+  needed.
+- The Compose database was left empty at revision 0001; both services remain running.
+
+Environment note: a separate Homebrew PostgreSQL already owns host port 5432. Host clients
+therefore reach Homebrew rather than the Docker database. Validation ran inside the Docker
+network, where `postgres:5432` is unambiguous.
+
+### CodeRabbit review
+
+Two scopes were required because Claude's cycle-3 source was already committed:
+
+1. `--committed --base-commit 19da329` reviewed both cycle-3 Builder commits.
+2. `--uncommitted --include-untracked` reviewed the final Validator changes.
+
+Confirmed:
+
+- Major: digest validation checks for one aggregate URL, not one URL per quote
+  (`FINDING-3.5`).
+- Major: the deferred HNSW migration uses blocking `CREATE INDEX` even though the deployed
+  versions support concurrent construction (`FINDING-3.4`).
+- Validator improvement: Alembic subprocesses now have an explicit timeout.
+- Session-close feedback: resolve `TEST-CONFLICT-3.1`, populate `last_validation`, remove
+  the stale blocker, and retain `OQ-6`; done at handoff.
+
+Rejected:
+
+- `claude_log.md` ownership is not contradictory: Claude appends its log; the Validator is
+  forbidden from editing it.
+- Test-only database environment access belongs in integration configuration. Adding an
+  `IDEAS_MINING_TEST_DATABASE_URL` accessor to production `config.py` would violate the
+  Validator write boundary and mix test controls into runtime configuration.
+
+### Findings
+
+#### [FINDING-3.1] [PASSED] — clean async dependency installation
+- `sqlalchemy[asyncio]` installs greenlet in a new environment, and Alembic connects without
+  an ad-hoc package install.
+- Traces to: `DECISION-3.1`, `INV-5`.
+
+#### [FINDING-3.2] [PASSED] — safe default migration and opt-in index mechanics
+- Default head is 0001 with zero HNSW indexes. The deferred config sees 0002 and creates
+  exactly two cosine indexes. The stale Validator path is fixed.
+- Traces to: `DECISION-3.2`, `TEST-CONFLICT-3.1`.
+
+#### [FINDING-3.3] [FAILED] — deferred revision breaks later normal deployments
+- After the opt-in command records revision 0002, the next normal
+  `alembic upgrade head` exits 255: `Can't locate revision identified by '0002'`.
+  Hiding 0002 from the default ScriptDirectory also makes the default deployment path
+  unable to understand databases that have legitimately applied it.
+- Traces to: `DECISION-3.2`, `INV-5`.
+
+#### [FINDING-3.4] [FAILED] — deferred HNSW creation blocks writes
+- Both indexes use plain `CREATE INDEX` inside Alembic's transaction. The installed
+  PostgreSQL/pgvector supports `CREATE INDEX CONCURRENTLY`; use Alembic's autocommit block,
+  or explicitly enforce a maintenance window. The current migration does neither.
+- Traces to: `DECISION-3.2`, `INV-5`.
+
+#### [FINDING-3.5] [FAILED] — one linked quote masks an unlinked quote
+- `validate_model_output()` accepts a digest containing one quote with a URL and a second
+  quote without one because `_URL_RE.search(prose)` is aggregate. `INV-10` requires every
+  quote to carry its own source URL.
+- Traces to: `DECISION-3.3`, `INV-10`.
+
+#### [FINDING-3.6] [PASSED] — other digest recovery contracts hold
+- Empty/whitespace output, `max_tokens`, and output with no URL are rejected before any DB
+  row, file, or SMTP attempt. Valid linked output passes. Prompt and persisted cluster IDs
+  come from the same ranking.
+- Traces to: `DECISION-3.3`, `DECISION-3.4`, `INV-5`, `INV-10`, `INV-11`.
+
+#### [FINDING-3.7] [PASSED] — accepted batch ID remains recoverable
+- Tracking-persistence failure logs the accepted Anthropic batch ID at ERROR and re-raises.
+- Traces to: `DECISION-3.5`, `INV-5`.
+
+#### [FINDING-3.8] [PASSED] — Reddit and HN isolate malformed third-party data
+- All three Reddit failure domains preserve partial progress. HN timestamp parsing drops
+  unusable values and attaches UTC to a naive ISO timestamp.
+- Traces to: `DECISION-3.6`, `DECISION-3.7`, `INV-3`, `INV-5`.
+
+#### [FINDING-3.9] [PASSED] — reclustering is FK-safe and preserves embeddings
+- Live PostgreSQL accepts the DELETE-based clear, cluster memberships become null before
+  reassignment, and stored embeddings remain unchanged.
+- Traces to: `DECISION-3.8`, `INV-2`, `INV-5`, `INV-6`.
+
+#### [FINDING-3.10] [PASSED] — Compose and worker hardening hold
+- PostgreSQL/Redis binds are loopback-only. Log levels normalize padding/case and safely
+  fall back to INFO for unknown and numeric strings.
+- Traces to: `DECISION-3.9`, `DECISION-3.10`, `INV-5`.
+
+#### [FINDING-3.11] [BLOCKER] — manual quality acceptance remains human-owned
+- No proxy assertion was invented for pain-point normalization, vertical disagreements, or
+  digest usefulness. Actual model output still needs human review.
+- Traces to: `OQ-6`, `INV-1`, `INV-10`.
+
+### Handoff
+- Status: `VALIDATION_COMPLETE`; turn returned to Claude.
+- Builder action: fix `FINDING-3.3`, `FINDING-3.4`, and `FINDING-3.5`.
+- `TEST-CONFLICT-3.1` is resolved and removed from `open_blockers`.
+- `OQ-6` remains `needs: human`.

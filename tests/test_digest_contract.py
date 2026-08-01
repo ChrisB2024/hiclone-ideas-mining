@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -112,11 +113,24 @@ async def test_digest_refuses_model_output_that_drops_every_source_url(
         tmp_path,
         prose='## INSURANCE\n> "A useful quote with no source link"',
     )
+    monkeypatch.setattr(digest_module.settings, "smtp_host", "smtp.invalid")
+    monkeypatch.setattr(
+        digest_module.settings,
+        "digest_to_address",
+        "founder@example.com",
+    )
+
+    async def should_not_send(function: object, *args: object) -> None:
+        del function, args
+        pytest.fail("delivery was attempted for a digest with no source URL")
+
+    monkeypatch.setattr(digest_module.asyncio, "to_thread", should_not_send)
 
     with pytest.raises(ValueError, match="source URL"):
         await digest_module.send_digest()
 
     assert persisted == []
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize(
@@ -139,11 +153,114 @@ async def test_digest_refuses_empty_or_truncated_model_output(
         prose,
         stop_reason=stop_reason,
     )
+    monkeypatch.setattr(digest_module.settings, "smtp_host", "smtp.invalid")
+    monkeypatch.setattr(
+        digest_module.settings,
+        "digest_to_address",
+        "founder@example.com",
+    )
+
+    async def should_not_send(function: object, *args: object) -> None:
+        del function, args
+        pytest.fail("delivery was attempted for rejected model output")
+
+    monkeypatch.setattr(digest_module.asyncio, "to_thread", should_not_send)
 
     with pytest.raises(ValueError):
         await digest_module.send_digest()
 
     assert persisted == []
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("prose", ["", "   \n\t"])
+def test_validate_model_output_rejects_blank_text(prose: str) -> None:
+    with pytest.raises(ValueError, match="no text"):
+        digest_module.validate_model_output(prose, "end_turn")
+
+
+def test_validate_model_output_accepts_complete_linked_text() -> None:
+    digest_module.validate_model_output(
+        '> "A useful quote" https://example.com/source-thread',
+        "end_turn",
+    )
+
+
+def test_validate_model_output_requires_a_link_for_each_markdown_quote() -> None:
+    prose = (
+        '## INSURANCE\n> "Linked quote" https://example.com/one\n\n'
+        '## REAL ESTATE\n> "Unlinked quote"'
+    )
+
+    with pytest.raises(ValueError, match="source URL"):
+        digest_module.validate_model_output(prose, "end_turn")
+
+
+@pytest.mark.asyncio
+async def test_gather_digest_input_returns_ids_for_the_rendered_clusters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clusters = {
+        "insurance": [{
+            "id": 11,
+            "label": "Quote re-keying",
+            "score": 4.2,
+            "distinct_authors": 3,
+            "member_count": 4,
+            "last_seen_at": datetime(2026, 7, 30, tzinfo=UTC),
+        }],
+        "real_estate": [{
+            "id": 12,
+            "label": "Listing re-keying",
+            "score": 3.8,
+            "distinct_authors": 2,
+            "member_count": 2,
+            "last_seen_at": datetime(2026, 7, 29, tzinfo=UTC),
+        }],
+    }
+
+    async def fake_top_clusters(vertical: str, n: int) -> list[dict[str, object]]:
+        del n
+        return clusters[vertical]
+
+    class MemberResult:
+        def mappings(self) -> MemberResult:
+            return self
+
+        def all(self) -> list[dict[str, object]]:
+            return [{
+                "pain_point": "Operators manually re-key records.",
+                "who_has_it": "operator",
+                "current_workaround": "copy and paste",
+                "willingness_to_pay_signal": "implied",
+                "excerpt": "This takes hours.",
+                "url": "https://example.com/thread",
+            }]
+
+    class MemberSession:
+        async def execute(
+            self,
+            statement: object,
+            parameters: object | None = None,
+        ) -> MemberResult:
+            del statement, parameters
+            return MemberResult()
+
+    @asynccontextmanager
+    async def fake_get_session() -> Any:
+        yield MemberSession()
+
+    monkeypatch.setattr(digest_module, "top_clusters", fake_top_clusters)
+    monkeypatch.setattr(digest_module, "get_session", fake_get_session)
+
+    prompt, cluster_ids = await digest_module.gather_digest_input(
+        datetime(2026, 7, 20, tzinfo=UTC),
+        datetime(2026, 7, 31, tzinfo=UTC),
+    )
+
+    assert cluster_ids == [11, 12]
+    assert prompt.index("Quote re-keying") < prompt.index("Listing re-keying")
+    assert prompt.count("https://example.com/thread") == 2
 
 
 @pytest.mark.asyncio

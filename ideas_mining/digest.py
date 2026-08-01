@@ -243,6 +243,52 @@ async def render_header(period_start: datetime, period_end: datetime) -> str:
 #: all, not that they resolve.
 _URL_RE = re.compile(r"https?://\S+")
 
+#: A markdown blockquote line. The prompt asks for "the strongest verbatim quote with
+#: its link", and the model renders those as blockquotes.
+_QUOTE_LINE_RE = re.compile(r"^\s*>")
+
+
+def _quote_blocks(prose: str) -> list[str]:
+    """Group the prose's blockquote lines into blocks, each with its trailing context.
+
+    Inputs:
+        prose: the model's markdown.
+
+    Returns:
+        One string per quote block: the quoted lines, plus the first non-blank line
+        after them.
+
+    Why blocks rather than lines: a quote is routinely written across several ``>``
+    lines with the link on the last one, or as a quote followed by an attribution line
+    carrying the URL. Checking line-by-line would reject both of those correct shapes;
+    checking the whole document at once (the FINDING-3.5 bug) accepts a digest where
+    one quote is linked and the next is not.
+    """
+    blocks: list[str] = []
+    lines = prose.splitlines()
+    index = 0
+
+    while index < len(lines):
+        if not _QUOTE_LINE_RE.match(lines[index]):
+            index += 1
+            continue
+
+        block: list[str] = []
+        while index < len(lines) and _QUOTE_LINE_RE.match(lines[index]):
+            block.append(lines[index])
+            index += 1
+
+        # The attribution line immediately after the quote counts as part of it.
+        trailing = index
+        while trailing < len(lines) and not lines[trailing].strip():
+            trailing += 1
+        if trailing < len(lines) and not _QUOTE_LINE_RE.match(lines[trailing]):
+            block.append(lines[trailing])
+
+        blocks.append("\n".join(block))
+
+    return blocks
+
 
 def validate_model_output(prose: str, stop_reason: str | None) -> None:
     """Refuse digest prose that is empty, truncated, or stripped of its source links.
@@ -263,10 +309,14 @@ def validate_model_output(prose: str, stop_reason: str | None) -> None:
     * **``stop_reason == "max_tokens"``.** The prose ends mid-sentence, usually inside
       the real-estate section, because that section comes second. The digest looks
       complete for insurance and silently drops the vertical it was cut off in.
-    * **No source URL anywhere.** This is INV-10. The thread authors are the leads; a
-      pain point without a link is trivia. A digest that reads beautifully and contains
-      no URLs has failed at its actual job, and it is the failure most likely to go
-      unnoticed, because the prose is exactly as persuasive either way.
+    * **A quote without its own source URL.** This is INV-10. The thread authors are
+      the leads; a pain point without a link is trivia. The check is **per quote**
+      (FINDING-3.5): an aggregate "does the document contain a URL" test passes a
+      digest whose first quote is linked and whose remaining nine are not, which is the
+      realistic failure — the model doesn't usually drop every link, it drops some. A
+      digest that reads beautifully has failed at its actual job if you can't email the
+      person, and it's the failure most likely to go unnoticed, because the prose is
+      exactly as persuasive either way.
     """
     if not prose.strip():
         raise ValueError("digest model returned no text; refusing to persist it")
@@ -276,7 +326,17 @@ def validate_model_output(prose: str, stop_reason: str | None) -> None:
             "digest was truncated at max_tokens; refusing to persist a partial digest"
         )
 
-    if not _URL_RE.search(prose):
+    blocks = _quote_blocks(prose)
+    unlinked = [block for block in blocks if not _URL_RE.search(block)]
+    if unlinked:
+        raise ValueError(
+            f"{len(unlinked)} of {len(blocks)} quotes carry no source URL (INV-10); "
+            f"refusing to persist it. First offender: {unlinked[0].strip()[:120]!r}"
+        )
+
+    # Prose with no blockquotes at all still has to link something, or there is no
+    # outreach target anywhere in the digest.
+    if not blocks and not _URL_RE.search(prose):
         raise ValueError(
             "digest contains no source URL (INV-10); refusing to persist it"
         )

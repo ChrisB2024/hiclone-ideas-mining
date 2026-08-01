@@ -784,3 +784,130 @@ taken on faith.
   9. `submit_enrichment` logs the batch id at ERROR when the tracking insert fails, and
      still raises.
 - Blockers: none `needs: builder`. `OQ-6` remains `needs: human`.
+
+---
+
+## Session 4 — 2026-08-01 — FIX CYCLE-3 VALIDATION FINDINGS
+
+### Context
+Reading from: `handoff.json` (turn=claude, cycle 4, VALIDATION_COMPLETE), Codex session 3
+in full. Addressing: `FINDING-3.3`, `FINDING-3.4`, `FINDING-3.5` — all `needs: builder`.
+Eight of Codex's eleven cycle-3 findings passed, including the clean-install check, the
+FK-safe reclustering, all three Reddit failure domains, and the batch-id recovery path.
+
+Codex ran this cycle inside Docker (Engine 29.4.0), which is the first time
+`docker-compose.yml` has actually been started by anyone.
+
+I validated my own fixes against a throwaway PostgreSQL 16.13 + pgvector 0.8.5 cluster on
+**port 55440** — the host's Homebrew cluster owns 5432 and holds four unrelated project
+databases, and the integration `conftest` issues `TRUNCATE ... CASCADE`, so pointing it at
+5432 was not an option.
+
+### Decisions
+
+#### [DECISION-4.1] `env.py` tolerates a database ahead on the opt-in chain — FINDING-3.3
+- **What:** before running migrations, the default config checks the recorded revision.
+  If it belongs to `migrations/deferred/`, it logs and exits 0. If it belongs to neither
+  chain, Alembic still raises.
+- **Why:** this is the fix for a bug I introduced in `DECISION-3.2`. Hiding 0002 from the
+  default `version_locations` is what stops `alembic upgrade head` applying it — but it
+  also meant the default config could no longer *recognise* a database that had
+  legitimately applied it. After anyone ran the opt-in command once, **every subsequent
+  ordinary deploy died** with `Can't locate revision identified by '0002'`. I made routine
+  deployment fragile in order to defer an index.
+- **[CONCEPT] "Fixes" that move the failure rather than remove it.** Cycle 3's finding was
+  "the deferred migration isn't deferred". I solved it by making the revision invisible to
+  the default config — which solved the stated problem exactly, and broke something the
+  finding hadn't mentioned. The tell is that I changed *what the tool can see* rather than
+  *what the tool does*. Visibility changes are cheap to make and have consequences
+  everywhere the thing was previously visible; this one had consequences in the one place
+  nobody tests, the second deploy.
+- **Deliberately not a blanket ignore:** an unknown revision that is in neither chain is a
+  rollback to an older checkout or real corruption, and still fails loudly.
+- **Bug found while building it:** the probe originally ran on the same connection Alembic
+  then migrated over. That left an open transaction, so Alembic's own
+  `begin_transaction()` nested inside it and the whole migration was rolled back at close
+  — `alembic upgrade head` reported success and created nothing. The probe now gets its
+  own connection. Worth remembering: with SQLAlchemy, *reading* on a connection starts a
+  transaction just as writing does.
+
+#### [DECISION-4.2] `CREATE INDEX CONCURRENTLY` in an autocommit block — FINDING-3.4
+- **What:** both hnsw indexes build concurrently, inside `op.get_context().autocommit_block()`,
+  with `IF NOT EXISTS`. Downgrade drops them concurrently too.
+- **Why:** plain `CREATE INDEX` takes a `SHARE` lock that blocks every INSERT and UPDATE on
+  the table for the whole build — on the two tables the pipeline writes to on every tick,
+  and on a table that by definition holds thousands of rows by the time this is worth
+  running. `CONCURRENTLY` builds in two passes and never blocks writers.
+- **[CONCEPT] Why concurrent index builds can't be transactional.** A normal index is built
+  in one pass while writers are locked out, so it can be rolled back like anything else. A
+  concurrent build instead scans the table twice and waits for in-flight transactions in
+  between — which means it must be able to *see* other transactions committing while it
+  runs, and therefore cannot itself sit inside one. Alembic wraps migrations in a
+  transaction by default, so the statement needs an explicit escape hatch.
+- **Tradeoff, stated plainly:** those statements are no longer covered by the migration's
+  transaction, so if the second index fails the first is already committed. Both use
+  `IF NOT EXISTS` so re-running is safe. The real caveat is that a failed concurrent build
+  leaves an **invalid** index that still slows writes and that `IF NOT EXISTS` considers
+  present — documented in the migration with the query to find it.
+
+#### [DECISION-4.3] URL validation is per quote, not per document — FINDING-3.5
+- **What:** `_quote_blocks()` groups consecutive `>` lines plus the first non-blank line
+  after them; every block must contain a URL. Prose with no blockquotes must still contain
+  at least one URL.
+- **Why:** `_URL_RE.search(prose)` asked "does this document contain a link anywhere",
+  which one linked quote satisfies for all ten. The realistic failure isn't the model
+  dropping every link — it's dropping some.
+- **Why blocks and not lines:** a quote is routinely written across several `>` lines with
+  the link on the last one, or as a quote followed by an attribution line carrying the URL.
+  A per-line rule would reject both of those correct shapes.
+
+### Work Done
+- `migrations/env.py` — `_opt_in_revisions`, `_managed_revisions`,
+  `_database_is_ahead_on_opt_in_chain`, separate probe connection.
+- `migrations/deferred/0002_hnsw_indexes.py` — concurrent build/drop in autocommit blocks.
+- `ideas_mining/digest.py` — `_QUOTE_LINE_RE`, `_quote_blocks`, per-quote enforcement.
+
+### Invariants Verified
+- [x] INV-10 — now enforced per quote rather than per digest.
+- [x] INV-5 — the default deployment path is resumable from any state the opt-in chain can
+      leave the database in. Verified end to end, not just asserted.
+
+### Live verification (port 55440, PostgreSQL 16.13 + pgvector 0.8.5)
+Full suite: **102 passed, 0 failed, 0 skipped** — the integration tests ran rather than
+skipping, for the first time on this machine.
+
+Migration lifecycle, checked by hand against the database rather than through the tests:
+
+| step | rc | `alembic_version` | hnsw indexes |
+|---|---|---|---|
+| `alembic upgrade head` | 0 | 0001 | 0 |
+| `alembic -c alembic.deferred.ini upgrade head` | 0 | 0002 | 2 |
+| `alembic upgrade head` (again, after opt-in) | 0 | 0002 | 2 |
+| `alembic -c alembic.deferred.ini downgrade 0001` | 0 | 0001 | 0 |
+
+Both indexes are `vector_cosine_ops`, and `pg_index` reports zero invalid indexes after the
+concurrent build.
+
+### Security Considerations
+No change. The env.py probe runs one read-only `to_regclass` / `version_num` query on a
+connection built from `settings`; no credential is logged.
+
+### Open Questions
+- `OQ-6` unchanged, still `needs: human`, and now the only open item in the protocol.
+
+### Handoff
+- Status: READY_FOR_VALIDATION
+- Codex should test:
+  1. `_quote_blocks` directly — multi-line quotes with the link on the last line, a quote
+     followed by a blank line then an attribution line carrying the URL, nested `>>`, and
+     prose with no quotes at all.
+  2. That a digest with ten quotes and nine links is rejected, naming the offender.
+  3. `env.py`'s tolerance boundary: a revision in neither chain must still fail loudly.
+     That's the assertion that stops `DECISION-4.1` from degenerating into "ignore unknown
+     revisions".
+  4. That `alembic upgrade head` on a **fresh** database still creates all five tables —
+     the regression I hit while building this, where the probe's transaction silently
+     rolled back the entire migration while reporting success.
+  5. Concurrent index construction against a table under concurrent writes, if that's
+     cheap to arrange; otherwise assert the autocommit block and `IF NOT EXISTS` textually.
+- Blockers: none `needs: builder`. `OQ-6` remains `needs: human`.
