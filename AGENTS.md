@@ -36,7 +36,29 @@ Builder, **even when they look like test data**.
 **If a test cannot be written without changing a Builder-owned file: do not change it.** File
 a `[BLOCKER]` naming the file and the exact change needed, and add it to `open_blockers`.
 
-Never edit `.agent/claude_log.md`. Never edit anything under `specs/`.
+Never edit `.agent/claude_log.md`. Never edit anything under `specs/`. **`tools/` is
+Builder-owned source** — the protocol tooling (`dadp_backfill.py`, `dadp_report.py`) lives
+there and you run it but never edit it. If it needs a change, file a `[BLOCKER]`.
+
+### 3a. `.agent/ledger.jsonl` — the one file you and Claude both write
+
+The "tests vs source" boundary and "never edit the other agent's log" do not cover the
+ledger, so the rule is explicit, and it is **identical** in `AGENTS.md`, `CLAUDE.md`, and
+`dadp.md`:
+
+- **Append-only.** New rows go at the end of the file. Never rewrite, reorder, reformat, or
+  delete an existing line — not even your own, not even to fix a typo. Supersede a mistake
+  by appending a new row; the history is the point.
+- **Own rows only.** You append rows with `"agent": "codex"`. Rows with
+  `"agent": "claude"` are the Builder's and you never touch them.
+- **One line, one JSON object.** No pretty-printing, no blank lines, no trailing commas. A
+  line that does not parse breaks every graph derived from it.
+- `seq` increases strictly across the whole file, regardless of which agent wrote the row.
+- **Never hand-author Mermaid in `codex_log.md`.** Diagrams are derived from the ledger by
+  `tools/dadp_report.py`. A hand-drawn graph is a second source of truth that drifts from
+  the router.
+
+`.agent/DASHBOARD.md` is generated output. Regenerate it; never edit it.
 
 ## 4. Three test categories — all required
 
@@ -83,9 +105,24 @@ yourself destroys the audit trail and the human's ability to learn from the exch
 ## 7. Session end
 
 1. Append to `.agent/codex_log.md`.
-2. Populate `last_validation` and `open_blockers` in `handoff.json`.
-3. Set `turn: "claude"`, `status: "VALIDATION_COMPLETE"`, **increment `cycle`**, update
+2. **Append your rows to `.agent/ledger.jsonl`** — one line per `FINDING-N.M` (with
+   `status`, `target`, `traces_to`, and `needs`), plus one `result` row for the session
+   (`id: "VALIDATION-N"`, `counts`: passed / failed / skipped / blockers). Every row gets
+   `"agent": "codex"`, the next `seq`, and a `log_anchor` of `codex_log.md#session-N`.
+   Append only — see §3a.
+3. Populate `last_validation` and `open_blockers` in `handoff.json`. `traces_to` is an
+   **array** in `findings[]` and in `open_blockers[]` alike — the old scalar
+   `traces_to_decision` is retired.
+4. Set `turn: "claude"`, `status: "VALIDATION_COMPLETE"`, **increment `cycle`**, update
    `updated_at`.
+5. Run `python3 tools/dadp_report.py` to regenerate `.agent/DASHBOARD.md`. Section 2
+   (finding lifecycle chains) is the check on your own work: a chain that has grown for
+   three cycles without turning green is a fix that keeps missing, and it deserves a
+   harder test than the one that just passed.
+
+A finding's `traces_to` is what makes the lifecycle chains derivable — an untraceable
+finding is a bug report, not a validation (§5), and it is also an orphan node in every
+graph. Keep the `- Traces to:` bullet to bare identifiers so it parses.
 
 ---
 

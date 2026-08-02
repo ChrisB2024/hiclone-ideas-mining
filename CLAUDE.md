@@ -35,7 +35,8 @@ Set `status: "BUILDING"` in `handoff.json` as your first write of the session.
 ## 4. Write boundary — source only
 
 You own: application source, migrations, config, dependency manifests, runtime data files,
-`docker-compose.yml`, `.env.example`, and anything source imports or reads at runtime.
+`docker-compose.yml`, `.env.example`, `tools/` (the protocol tooling — `dadp_backfill.py`,
+`dadp_report.py`), and anything source imports or reads at runtime.
 
 You do **not** own, and must never create or edit:
 
@@ -49,6 +50,28 @@ You do **not** own, and must never create or edit:
 **The ambiguous cases in this repo, decided:** seed data and sample configs consumed by
 source are yours even though they look like test data. `docker-compose.yml` is yours (source
 reads it at runtime) — but see `OQ-2`, the human hasn't confirmed.
+
+### 4a. `.agent/ledger.jsonl` — the one file you and Codex both write
+
+The "source vs tests" boundary and "never edit the other agent's log" do not cover the
+ledger, so the rule is explicit, and it is **identical** in `CLAUDE.md`, `AGENTS.md`, and
+`dadp.md`:
+
+- **Append-only.** New rows go at the end of the file. Never rewrite, reorder, reformat, or
+  delete an existing line — not even your own, not even to fix a typo. Supersede a mistake
+  by appending a new row; the history is the point.
+- **Own rows only.** You append rows with `"agent": "claude"`. Rows with
+  `"agent": "codex"` are Codex's and you never touch them.
+- **One line, one JSON object.** No pretty-printing, no blank lines, no trailing commas. A
+  line that does not parse breaks every graph derived from it.
+- `seq` increases strictly across the whole file, regardless of which agent wrote the row.
+- **Never hand-author Mermaid in `claude_log.md`.** Diagrams are derived from the ledger by
+  `tools/dadp_report.py`. A hand-drawn graph is a second source of truth that drifts from
+  the router.
+
+`.agent/DASHBOARD.md` is generated output. Regenerate it; never edit it.
+`tools/dadp_backfill.py` rebuilds the whole ledger from both logs — it is a repair tool, not
+part of the session loop.
 
 ## 5. Document every function
 
@@ -68,10 +91,23 @@ is the one failure mode this protocol cannot catch.
 ## 8. Session end
 
 1. Append a session block to `.agent/claude_log.md` (format below).
-2. Populate `handoff.json.last_build` completely — `modules`, `files_written`,
-   `files_modified`, `decisions`, `invariants_asserted`, `spec_deviations`, `test_targets`,
-   `known_edge_cases`, `log_anchor`.
-3. Set `turn: "codex"`, `status: "READY_FOR_VALIDATION"`, and update `updated_at`.
+2. **Append your rows to `.agent/ledger.jsonl`** — one line per `DECISION-N.M`, one per
+   `[SPEC_DEVIATION]`, and one `result` row for the session (`id: "BUILD-N"`,
+   `traces_to`: the invariants you actually verified, `counts`: your suite run). Every row
+   gets `"agent": "claude"`, the next `seq`, and a `log_anchor` of
+   `claude_log.md#session-N`. Append only — see §4a.
+3. Populate `handoff.json.last_build` completely — `modules`, `files_written`,
+   `files_modified`, `decisions` (each with `traces_to`), `invariants_asserted`,
+   `spec_deviations`, `test_targets`, `known_edge_cases`, `log_anchor`.
+4. Set `turn: "codex"`, `status: "READY_FOR_VALIDATION"`, and update `updated_at`.
+5. Run `python3 tools/dadp_report.py` to regenerate `.agent/DASHBOARD.md`, and read
+   section 1 before you close. If something you thought you fixed is still listed open,
+   that is the finding to resolve now, not next cycle.
+
+`traces_to` on a decision is what makes the lifecycle chains derivable. Keep the title
+convention — `#### [DECISION-N.M] Title — FINDING-X.Y` — and mirror the same ids into the
+ledger row and into `handoff.json.last_build.decisions[].traces_to`. A decision with an
+empty `traces_to` is an orphan node in every graph.
 
 `test_targets` and `decisions[].test_implication` are **how you tell Codex what to test
 without writing tests yourself.** A vague `test_targets` produces vague validation.

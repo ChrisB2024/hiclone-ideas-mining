@@ -23,6 +23,9 @@
     "decisions": [
       {
         "id": "DECISION-5.1",
+        "traces_to": [
+          "FINDING-4.4"
+        ],
         "summary": "Quote detection covers plain-text quotes, not just blockquotes - FINDING-4.4",
         "rationale": "Cycle 4 enforced links per '>' block. The prompt asks for markdown and for a verbatim quote with its link, but never for blockquote syntax; the model frequently writes 'Strongest quote: \"...\" https://...'. With no blockquotes present the per-quote rule found nothing and fell through to the aggregate check FINDING-3.5 was raised about. I validated a format the producer never promised.",
         "tradeoff": "Needs a heuristic for what a quote is. Keyed on a quotation-marked span, which is what the model actually produces.",
@@ -33,6 +36,9 @@
       },
       {
         "id": "DECISION-5.2",
+        "traces_to": [
+          "INV-10"
+        ],
         "summary": "Two further holes found by hand, not by the suite",
         "rationale": "(a) the quoted-span regex required 2+ inner characters, so 'A' was invisible and short quotes produced zero units. (b) MORE SERIOUS: the trailing-attribution rule absorbed the next non-blank line into a blockquote, so a linked blockquote followed by an unlinked plain-text quote swallowed the latter and the digest was ACCEPTED - a live INV-10 violation that passed every test in the suite. The trailing line is now only absorbed when it is not itself a quote.",
         "tradeoff": "An attribution line that happens to contain quotation marks is now treated as its own quote and must carry a URL.",
@@ -43,6 +49,9 @@
       },
       {
         "id": "DECISION-5.3",
+        "traces_to": [
+          "FINDING-4.5"
+        ],
         "summary": "Opt-in migration reconciles a wrong or invalid existing index - FINDING-4.5",
         "rationale": "IF NOT EXISTS matches on the index NAME only, so an invalid leftover from a failed concurrent build, or an index on the wrong operator class, is accepted and Alembic then records 0002. specs/04 warns the wrong opclass silently gives worse neighbours rather than erroring; this made that silent failure reachable through the documented procedure and stamped as done.",
         "tradeoff": "The migration now drops an index it did not create. Safe because both names are owned by this migration. Offline --sql mode skips reconciliation, which needs a connection.",
@@ -53,6 +62,9 @@
       },
       {
         "id": "DECISION-5.4",
+        "traces_to": [
+          "FINDING-4.6"
+        ],
         "summary": "Opt-in tolerance applies to `upgrade` only - FINDING-4.6",
         "rationale": "DECISION-4.1 made EVERY alembic command a no-op on an opt-in database: `downgrade base` exited 0, printed nothing, and left all five tables and revision 0002 intact. A command reporting success for work it did not do is worse than the error it suppressed - the error is survivable, the false success is what you act on.",
         "tradeoff": "Depends on Alembic naming its per-command migration function (`upgrade`/`downgrade`/`do_stamp`). First attempt read context.context_opts in env.py, which does not exist there because alembic.context is a module of proxy FUNCTIONS, not the EnvironmentContext - it silently read {} and disabled the tolerance entirely. The check now runs after context.configure(), which copies those options onto the MigrationContext.",
@@ -206,7 +218,7 @@
       "severity": "BLOCKER",
       "target": ".spec/system_spec.md",
       "detail": "Manual LLM and digest quality criteria have no assertion form: pain-point normalization, vertical disagreements, and digest usefulness need a human reading real model output. The pipeline has still never run against real data, so these cannot be exercised yet.",
-      "traces_to_decision": null,
+      "traces_to": [],
       "needs": "human"
     }
   ]
